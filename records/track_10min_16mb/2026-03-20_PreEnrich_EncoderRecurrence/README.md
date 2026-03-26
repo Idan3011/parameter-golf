@@ -1,6 +1,6 @@
 ## EMA-GPU + Multi-Order N-gram Backoff + Pre-Enrichment + XSA
 
-**val_bpb: 0.9393** (multi-order n-gram backoff 2-11, entropy-adaptive alpha + pre-enrichment confidence) | 14.94 MB | 8xH100 SXM, 600s
+**val_bpb: 0.3001** (two-phase shared n-gram cache, orders 2-11, per-order adaptive alpha + PE confidence) | 14.94 MB | 8xH100 SXM, 600s
 
 ---
 
@@ -8,7 +8,7 @@
 
 | Metric | Value |
 |---|---|
-| **val_bpb (n-gram + PE confidence)** | **0.9393** |
+| **val_bpb (shared cache + PE confidence)** | **0.3001** |
 | Sliding window val_bpb | 1.1478 |
 | Standard eval val_bpb (post-quant) | 1.1690 |
 | Pre-quant val_bpb | 1.1646 |
@@ -63,7 +63,7 @@ Multi-order n-gram backoff with entropy-adaptive alpha during sliding window eva
 - No oracle selection: alpha depends solely on model's own entropy, never on ground-truth
 - No cross-GPU sync: each GPU maintains its own independent cache
 
-**Improvement:** 1.1478 → 0.9393 = **-0.209 BPB**
+**Improvement:** 1.1478 → 0.3001 = **-0.848 BPB**
 
 #### Pre-Enrichment Confidence Modulation
 
@@ -88,6 +88,19 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 All defaults baked in. No env vars needed. 8xH100 SXM, 600s training + ~182s eval.
 
 ---
+
+### Credits
+- Muon optimizer — modded-nanogpt baseline (kellerjordan)
+- SmearGate + BigramHash — PR #65 (@aquariouseworkman)
+- XSA — arXiv:2603.09078; GQA-aware PR #265 (@unnir)
+- EMA + GPTQ-lite + warmdown tuning — PR #414 (@signalrush)
+- N-gram eval cache — concept PR #659 (@deanbrr); fixed 5-gram PR #706 (@newjordan); multi-order entropy-adaptive PR #727 (@Asukabot0)
+- Shared GPU n-gram cache — PR #796 (@Robby955); chunk-synchronized PR #800 (@newjordan); PR #809 (@AayushBaniya2006)
+- Per-order adaptive alpha — PR #798 (@travispchen); Cubric scaling PR #800 (@newjordan)
+- Overtone init — modded-nanogpt baseline
+- GELU Pre-Enrichment — original to this submission
+- EMA on GPU — original to this submission
+- Pre-Enrichment Confidence Modulation — original to this submission
 
 ### Included Files
 
