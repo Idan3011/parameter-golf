@@ -1,6 +1,6 @@
-## EMA-GPU + Multi-Order N-gram Backoff + Pre-Enrichment + XSA
+## Phrase Cache + N-gram Backoff + EMA-GPU + Pre-Enrichment + XSA
 
-**val_bpb: 0.2995** (3-seed mean, std 0.0016) | 14.94 MB | 8xH100 SXM, 600s
+**val_bpb: 0.2722** (phrase cache + n-gram backoff 2-11, per-order adaptive alpha + PE confidence) | 14.94 MB | 8xH100 SXM, 600s
 
 ---
 
