@@ -1,23 +1,18 @@
 ## EMA-GPU + Multi-Order N-gram Backoff + Pre-Enrichment + XSA
 
-**val_bpb: 0.3001** (two-phase shared n-gram cache, orders 2-11, per-order adaptive alpha + PE confidence) | 14.94 MB | 8xH100 SXM, 600s
+**val_bpb: 0.2995** (3-seed mean, std 0.0016) | 14.94 MB | 8xH100 SXM, 600s
 
 ---
 
-### Results
+### 3-Seed Results
 
-| Metric | Value |
-|---|---|
-| **val_bpb (shared cache + PE confidence)** | **0.3001** |
-| Sliding window val_bpb | 1.1478 |
-| Standard eval val_bpb (post-quant) | 1.1690 |
-| Pre-quant val_bpb | 1.1646 |
-| Quant gap | 0.004 |
-| Steps | 9,268 (64.7ms/step) |
-| Training time | 600s |
-| Peak memory | 13,058 MiB |
-| Artifact size | 14,942,971 bytes |
-| Model parameters | 25,254,992 |
+| Seed | Steps | Sliding BPB | val_bpb | Artifact |
+|---|---|---|---|---|
+| 1337 | 9,268 | 1.1478 | 0.3001 | 14,942,971 |
+| 42 | 9,318 | 1.1468 | 0.2977 | 14,922,769 |
+| 3011 | 9,322 | 1.1463 | 0.3008 | 14,939,305 |
+| **Mean** | — | **1.1470** | **0.2995** | — |
+| **Std** | — | — | **0.0016** | — |
 
 ---
 

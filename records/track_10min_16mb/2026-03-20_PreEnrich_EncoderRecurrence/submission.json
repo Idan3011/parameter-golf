@@ -2,10 +2,12 @@
   "author": "Idanr",
   "github_id": "idan3011",
   "name": "Two-Phase Shared N-gram Cache + EMA-GPU + Pre-Enrichment + XSA",
-  "blurb": "Two-phase eval: distributed GPU forward + global sequential n-gram cache (orders 2-11). Per-order adaptive alpha + PE confidence modulation. EMA on GPU (64.7ms/step, 9268 steps). GELU pre-enrichment + XSA-4 + SmearGate + BigramHash + int6 QAT + lzma. 10L 512d. Verified identical on 1xGPU.",
-  "date": "2026-03-26T05:30:00Z",
+  "blurb": "Two-phase eval: distributed GPU forward + global sequential n-gram cache (orders 2-11). Per-order adaptive alpha + PE confidence modulation. EMA on GPU (64.7ms/step). 10L 512d. 3-seed mean 0.2995 (std 0.0016).",
+  "date": "2026-03-26T07:45:00Z",
   "val_loss": 1.93793804,
-  "val_bpb": 0.30008709,
+  "val_bpb": 0.29953465,
+  "val_bpb_seeds": [0.30008709, 0.29765751, 0.30079936],
+  "val_bpb_std": 0.0016,
   "pre_quant_val_loss": 1.9663,
   "pre_quant_val_bpb": 1.1646,
   "step_stop": 9268,
@@ -13,5 +15,5 @@
   "eval_time_seconds": 204.138,
   "bytes_total": 14942971,
   "bytes_model_int6_lzma": 14878748,
-  "bytes_code": 64223
+  "bytes_code": 66581
 }
