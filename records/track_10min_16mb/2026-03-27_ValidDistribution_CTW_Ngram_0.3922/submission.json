@@ -1,0 +1,9 @@
+{
+  "name": "Valid-Distribution N-gram: 1024-token normalized + Bayesian first-match",
+  "val_bpb": 0.3922,
+  "bytes_total": 14942971,
+  "blurb": "Only submission computing n-gram probabilities across ALL 1024 tokens and normalizing to a proper distribution. First-match-wins backoff (orders 11-2) with Bayesian local estimate. Fixed 0.5 blend. Quantifies collision premium: 0.2722 (collision-exploiting) vs 0.3922 (valid distributions) = 0.12 BPP from inflated probabilities. EVAL_ONLY on PR #810 artifact.",
+  "author": "idan3011",
+  "github_id": "idan3011",
+  "date": "2026-03-27"
+}
