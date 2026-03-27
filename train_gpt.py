@@ -374,49 +374,59 @@ def eval_val_sliding(
     sort_idx = all_sp.argsort()
     all_sp = all_sp[sort_idx]; all_st = all_st[sort_idx]; all_sm = all_sm[sort_idx]
     print(f"  phase2: {all_sp.shape[0]} scored tokens, rank {rank}", flush=True)
-    ng_ctx, ng_pair = {}, {}
-    for order in _NG_ORDERS:
-        ng_ctx[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
-        ng_pair[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
-    ng_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     chunk_size = 32768
     all_tokens = torch.arange(args.vocab_size, device=device)
-    for ci in range(0, all_sp.shape[0], chunk_size):
-        ce = min(ci + chunk_size, all_sp.shape[0])
-        ap = all_sp[ci:ce]; at = all_st[ci:ce]; amp = all_sm[ci:ce]
-        p_combined = amp.clone()
-        found = torch.zeros(ap.shape[0], dtype=torch.bool, device=device)
+    experiments = [("A_fixed50", None), ("B_conf50", 50.0)]
+    ng_bpb = 0.0
+    for exp_name, conf_gain in experiments:
+        ng_ctx, ng_pair = {}, {}
         for order in _NG_ORDERS:
-            m = (ap >= order) & (~found)
-            if not m.any():
-                continue
-            ctx_h = ng_hashes[order][ap[m]]
-            ctx_c = ng_ctx[order][ctx_h].float()
-            has_ctx = ctx_c >= _NG_MIN
-            if not has_ctx.any():
-                continue
-            pair_h = (ctx_h[:, None] * _NG_PAIR_MULT + all_tokens[None, :]) % _NG_B
-            pair_c = ng_pair[order][pair_h].float()
-            raw_correct = pair_c.gather(1, at[m, None]).squeeze(1)
-            del pair_h, pair_c
-            p_local = (raw_correct + _CTW_BETA * amp[m]) / (ctx_c + _CTW_BETA)
-            conf = ctx_c / (ctx_c + 12.0)
-            ix = m.nonzero(as_tuple=True)[0]
-            p_combined[ix[has_ctx]] = (1 - conf[has_ctx]) * amp[m][has_ctx] + conf[has_ctx] * p_local[has_ctx]
-            found[ix[has_ctx]] = True
-        ng_loss_sum -= torch.log(p_combined.clamp(min=1e-20)).to(torch.float64).sum()
-        for order in _NG_ORDERS:
-            v = ap >= order
-            if not v.any(): continue
-            ch = ng_hashes[order][ap[v]]
-            ng_ctx[order].scatter_add_(0, ch, torch.ones_like(ch, dtype=torch.int32))
-            pph = (ch * _NG_PAIR_MULT + at[v]) % _NG_B
-            ng_pair[order].scatter_add_(0, pph, torch.ones_like(pph, dtype=torch.int32))
-    if distributed:
-        dist.broadcast(ng_loss_sum, src=0)
+            ng_ctx[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
+            ng_pair[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
+        ng_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        for ci in range(0, all_sp.shape[0], chunk_size):
+            ce = min(ci + chunk_size, all_sp.shape[0])
+            ap = all_sp[ci:ce]; at = all_st[ci:ce]; amp = all_sm[ci:ce]
+            n = ap.shape[0]
+            best_p = torch.zeros(n, device=device)
+            best_ctx = torch.zeros(n, device=device)
+            found = torch.zeros(n, dtype=torch.bool, device=device)
+            for order in _NG_ORDERS:
+                m = (ap >= order) & (~found)
+                if not m.any():
+                    continue
+                ctx_h = ng_hashes[order][ap[m]]
+                ctx_c = ng_ctx[order][ctx_h].float()
+                has_ctx = ctx_c >= _NG_MIN
+                if not has_ctx.any():
+                    continue
+                pair_h = (ctx_h[has_ctx, None] * _NG_PAIR_MULT + all_tokens[None, :]) % _NG_B
+                pair_c = ng_pair[order][pair_h].float()
+                raw_correct = pair_c.gather(1, at[m][has_ctx, None]).squeeze(1)
+                del pair_h, pair_c
+                p_local = (raw_correct + _CTW_BETA * amp[m][has_ctx]) / (ctx_c[has_ctx] + _CTW_BETA)
+                ix = m.nonzero(as_tuple=True)[0][has_ctx]
+                best_p[ix] = p_local; best_ctx[ix] = ctx_c[has_ctx]; found[ix] = True
+            if conf_gain is None:
+                p_combined = torch.where(found, 0.5 * best_p + 0.5 * amp, amp)
+            else:
+                conf = best_ctx / (best_ctx + conf_gain)
+                p_combined = torch.where(found, (1 - conf) * amp + conf * best_p, amp)
+            ng_loss_sum -= torch.log(p_combined.clamp(min=1e-20)).to(torch.float64).sum()
+            for order in _NG_ORDERS:
+                v = ap >= order
+                if not v.any(): continue
+                ch = ng_hashes[order][ap[v]]
+                ng_ctx[order].scatter_add_(0, ch, torch.ones_like(ch, dtype=torch.int32))
+                pph = (ch * _NG_PAIR_MULT + at[v]) % _NG_B
+                ng_pair[order].scatter_add_(0, pph, torch.ones_like(pph, dtype=torch.int32))
+        if distributed:
+            dist.broadcast(ng_loss_sum, src=0)
+        exp_bpb = (ng_loss_sum / (total_byte_count * math.log(2.0))).item()
+        print(f"  experiment {exp_name}: val_bpb={exp_bpb:.8f}", flush=True)
+        ng_bpb = exp_bpb
     val_loss = (total_loss_sum / total_scored_tokens).item()
     bpb = (total_loss_sum / (total_byte_count * math.log(2.0))).item()
-    ng_bpb = (ng_loss_sum / (total_byte_count * math.log(2.0))).item()
     base_model.train()
     return float(val_loss), float(bpb), float(ng_bpb)
 
