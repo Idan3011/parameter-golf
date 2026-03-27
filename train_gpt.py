@@ -277,6 +277,185 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+<<<<<<< Updated upstream
+=======
+
+_NG_B = 1 << 22
+_NG_ORDERS = (11, 10, 9, 8, 7, 6, 5, 4, 3, 2)
+_NG_MIN = 1
+_NG_MULT = 265443576
+_NG_PAIR_MULT = 1000003
+_CTW_BETA = float(os.environ.get("CTW_BETA", "2.0"))
+_CTW_BLEND = float(os.environ.get("CTW_BLEND", "0.5"))
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    model: nn.Module | None = None,
+    stride: int = 64,
+    batch_size: int = 256,
+) -> tuple[float, float, float]:
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel()
+    windows: list[tuple[int, int]] = []
+    pos = 0
+    while pos + seq_len < total_tokens:
+        windows.append((pos, 0 if pos == 0 else seq_len - stride))
+        pos += stride
+    my_windows = windows[rank::world_size]
+    total_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    total_scored_tokens = torch.zeros((), device=device, dtype=torch.float64)
+    total_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    vt_gpu = val_tokens.to(device=device, dtype=torch.int64)
+    ng_hashes = {}
+    for order in _NG_ORDERS:
+        h = torch.zeros(total_tokens, dtype=torch.int64, device=device)
+        for ki in range(order - 1):
+            h[order-1:] = (h[order-1:] * _NG_MULT + vt_gpu[ki:total_tokens - order + 1 + ki]) % _NG_B
+        ng_hashes[order] = h
+    print(f"  ngram hashes precomputed", flush=True)
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "1"))
+    ttt_seq_len = 512
+    ttt_chunk_tokens = 131072
+    distributed = dist.is_available() and dist.is_initialized()
+    for n, p in base_model.named_parameters():
+        if 'blocks.0.' in n or 'blocks.1.' in n:
+            p.requires_grad_(False)
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    ttt_optimizer = torch.optim.AdamW(ttt_params, lr=1e-4, weight_decay=0.0)
+    ema_weights = {n: p.data.clone() for n, p in base_model.named_parameters()}
+    ema_decay = 0.998
+    num_mega = max(1, (total_tokens - 1) // ttt_chunk_tokens)
+    mega_assignments: list[list[tuple[int, int]]] = [[] for _ in range(num_mega)]
+    for win_start, score_start in my_windows:
+        last_pos = win_start + seq_len
+        mi = min(last_pos // ttt_chunk_tokens, num_mega - 1)
+        mega_assignments[mi].append((win_start, score_start))
+    ng_ctx, ng_pair = {}, {}
+    for order in _NG_ORDERS:
+        ng_ctx[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
+        ng_pair[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
+    ng_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    all_tokens = torch.arange(args.vocab_size, device=device)
+    ttt_total_ms = 0.0; ttt_step_count = 0
+    base_model.eval()
+    for mi in range(num_mega):
+        mw = mega_assignments[mi]
+        if not mw:
+            continue
+        if mi % 50 == 0:
+            print(f"  mega {mi}/{num_mega} windows={len(mw)}", flush=True)
+        scored_pos, scored_tgt, scored_mp = [], [], []
+        for bi in range(0, len(mw), batch_size):
+            bw = mw[bi:bi + batch_size]
+            x_list, y_list = [], []
+            for ws, _ in bw:
+                chunk = val_tokens[ws:ws + seq_len + 1]
+                x_list.append(chunk[:-1]); y_list.append(chunk[1:])
+            x = torch.stack(x_list).to(device=device, dtype=torch.int64)
+            y = torch.stack(y_list).to(device=device, dtype=torch.int64)
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = base_model.forward_logits(x)
+            per_token_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), seq_len)
+            lp = F.log_softmax(logits.float(), dim=-1)
+            tgt_p = lp.gather(-1, y.unsqueeze(-1)).squeeze(-1).exp()
+            for idx, (ws, ss) in enumerate(bw):
+                sl = per_token_loss[idx, ss:]
+                total_loss_sum += sl.to(torch.float64).sum()
+                total_scored_tokens += float(sl.numel())
+                sp = x[idx, ss:]; st = y[idx, ss:]
+                tb = base_bytes_lut[st].to(dtype=torch.int16)
+                tb += (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(dtype=torch.int16)
+                total_byte_count += tb.to(torch.float64).sum()
+                pos = torch.arange(ss, seq_len, dtype=torch.int64, device=device) + ws + 1
+                scored_pos.append(pos); scored_tgt.append(vt_gpu[pos]); scored_mp.append(tgt_p[idx, ss:])
+        if not scored_pos:
+            continue
+        ap = torch.cat(scored_pos); at = torch.cat(scored_tgt); amp = torch.cat(scored_mp)
+        if distributed:
+            dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_scored_tokens, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_byte_count, op=dist.ReduceOp.SUM)
+            _all = [ap, at, amp]
+            for ti in range(3):
+                sizes = [torch.tensor(_all[ti].shape[0], device=device) for _ in range(world_size)]
+                dist.all_gather(sizes, sizes[rank])
+                mx = max(s.item() for s in sizes)
+                padded = torch.zeros(mx, dtype=_all[ti].dtype, device=device)
+                padded[:_all[ti].shape[0]] = _all[ti]
+                gl = [torch.zeros_like(padded) for _ in range(world_size)]
+                dist.all_gather(gl, padded)
+                _all[ti] = torch.cat([g[:sizes[i].item()] for i, g in enumerate(gl)])
+            ap, at, amp = _all
+        si = ap.argsort(); ap = ap[si]; at = at[si]; amp = amp[si]
+        n = ap.shape[0]
+        best_p = torch.zeros(n, device=device); found = torch.zeros(n, dtype=torch.bool, device=device)
+        for order in _NG_ORDERS:
+            m = (ap >= order) & (~found)
+            if not m.any(): continue
+            ctx_h = ng_hashes[order][ap[m]]
+            ctx_c = ng_ctx[order][ctx_h].float(); has_ctx = ctx_c >= _NG_MIN
+            if not has_ctx.any(): continue
+            pair_h = (ctx_h[has_ctx, None] * _NG_PAIR_MULT + all_tokens[None, :]) % _NG_B
+            pair_c = ng_pair[order][pair_h].float()
+            raw_correct = pair_c.gather(1, at[m][has_ctx, None]).squeeze(1)
+            del pair_h, pair_c
+            p_local = (raw_correct + _CTW_BETA * amp[m][has_ctx]) / (ctx_c[has_ctx] + _CTW_BETA)
+            ix = m.nonzero(as_tuple=True)[0][has_ctx]
+            best_p[ix] = p_local; found[ix] = True
+        p_combined = torch.where(found, _CTW_BLEND * best_p + (1 - _CTW_BLEND) * amp, amp)
+        ng_loss_sum -= torch.log(p_combined.clamp(min=1e-20)).to(torch.float64).sum()
+        for order in _NG_ORDERS:
+            v = ap >= order
+            if not v.any(): continue
+            ch = ng_hashes[order][ap[v]]
+            ng_ctx[order].scatter_add_(0, ch, torch.ones_like(ch, dtype=torch.int32))
+            pph = (ch * _NG_PAIR_MULT + at[v]) % _NG_B
+            ng_pair[order].scatter_add_(0, pph, torch.ones_like(pph, dtype=torch.int32))
+        if ttt_epochs > 0 and model is not None:
+            t_ttt = time.perf_counter()
+            chunk_start = mi * ttt_chunk_tokens; chunk_end = min(chunk_start + ttt_chunk_tokens + 1, total_tokens)
+            chunk_toks = vt_gpu[chunk_start:chunk_end]
+            for block in base_model.blocks:
+                block.attn.rotary._cos_cached = None; block.attn.rotary._sin_cached = None
+            base_model.train()
+            for _ in range(ttt_epochs):
+                n_seq = (chunk_toks.numel() - 1) // ttt_seq_len
+                if n_seq == 0: break
+                tx = chunk_toks[:n_seq * ttt_seq_len].reshape(n_seq, ttt_seq_len)
+                ty = chunk_toks[1:n_seq * ttt_seq_len + 1].reshape(n_seq, ttt_seq_len)
+                ttt_optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    ttt_loss = model(tx, ty) if model is not None else base_model(tx, ty)
+                ttt_loss.backward()
+                ttt_optimizer.step()
+                ttt_step_count += 1
+            with torch.no_grad():
+                for nm, p in base_model.named_parameters():
+                    ema_weights[nm].mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+                    p.data.copy_(ema_weights[nm])
+            base_model.eval()
+            ttt_total_ms += 1000.0 * (time.perf_counter() - t_ttt)
+    print(f"  ttt_time:{ttt_total_ms:.0f}ms ttt_steps:{ttt_step_count}", flush=True)
+    if distributed:
+        dist.broadcast(ng_loss_sum, src=0)
+    val_loss = (total_loss_sum / total_scored_tokens).item()
+    bpb = (total_loss_sum / (total_byte_count * math.log(2.0))).item()
+    ng_bpb = (ng_loss_sum / (total_byte_count * math.log(2.0))).item()
+    base_model.train()
+    return float(val_loss), float(bpb), float(ng_bpb)
+
+
+
+>>>>>>> Stashed changes
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -1118,6 +1297,23 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
+<<<<<<< Updated upstream
+=======
+    torch.cuda.synchronize()
+    t_slide = time.perf_counter()
+    sw_val_loss, sw_val_bpb, ng_bpb = eval_val_sliding(
+        args, base_model, rank, world_size, device,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        model=model,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_sliding_window sliding_bpb:{sw_val_bpb:.4f} val_bpb:{ng_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+    )
+    log0(f"final_sliding_window_exact sliding_bpb:{sw_val_bpb:.8f} val_bpb:{ng_bpb:.8f}")
+
+>>>>>>> Stashed changes
     if distributed:
         dist.destroy_process_group()
 
