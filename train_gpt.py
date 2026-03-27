@@ -385,23 +385,25 @@ def eval_val_sliding(
         ce = min(ci + chunk_size, all_sp.shape[0])
         ap = all_sp[ci:ce]; at = all_st[ci:ce]; amp = all_sm[ci:ce]
         p_combined = amp.clone()
+        found = torch.zeros(ap.shape[0], dtype=torch.bool, device=device)
         for order in _NG_ORDERS:
-            valid = ap >= order
-            if not valid.any():
+            m = (ap >= order) & (~found)
+            if not m.any():
                 continue
-            ctx_h = ng_hashes[order][ap[valid]]
+            ctx_h = ng_hashes[order][ap[m]]
             ctx_c = ng_ctx[order][ctx_h].float()
             has_ctx = ctx_c >= _NG_MIN
+            if not has_ctx.any():
+                continue
             pair_h = (ctx_h[:, None] * _NG_PAIR_MULT + all_tokens[None, :]) % _NG_B
             pair_c = ng_pair[order][pair_h].float()
-            raw_correct = pair_c.gather(1, at[valid, None]).squeeze(1)
-            total_pairs = pair_c.sum(dim=1)
+            raw_correct = pair_c.gather(1, at[m, None]).squeeze(1)
             del pair_h, pair_c
-            p_local = (raw_correct + _CTW_BETA * amp[valid]) / (total_pairs + _CTW_BETA)
-            new_p = 0.5 * p_local + 0.5 * p_combined[valid]
-            update_mask = valid.clone()
-            update_mask[valid] &= has_ctx
-            p_combined[update_mask] = new_p[has_ctx]
+            p_local = (raw_correct + _CTW_BETA * amp[m]) / (ctx_c + _CTW_BETA)
+            conf = ctx_c / (ctx_c + 12.0)
+            ix = m.nonzero(as_tuple=True)[0]
+            p_combined[ix[has_ctx]] = (1 - conf[has_ctx]) * amp[m][has_ctx] + conf[has_ctx] * p_local[has_ctx]
+            found[ix[has_ctx]] = True
         ng_loss_sum -= torch.log(p_combined.clamp(min=1e-20)).to(torch.float64).sum()
         for order in _NG_ORDERS:
             v = ap >= order
