@@ -857,7 +857,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, mid_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
-            GDNLayer(mode='fused_recurrent', hidden_size=mid_dim, expand_k=1, expand_v=2,
+            GDNLayer(mode='chunk', hidden_size=mid_dim, expand_k=1, expand_v=2,
                      num_heads=4, use_gate=True, use_short_conv=True, conv_size=4)
             for _ in range(num_layers)
         ])
@@ -1034,7 +1034,7 @@ def main() -> None:
     for module in base_model.blocks.modules():
         if isinstance(module, nn.Linear) and not isinstance(module, CastedLinear):
             module.float()
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    compiled_model = base_model  # GDN layers incompatible with torch.compile
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
