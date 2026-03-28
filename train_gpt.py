@@ -874,14 +874,15 @@ class GPT(nn.Module):
         x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
         x0_shifted = F.pad(x0_full[:, :-(sf-1) or T, :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x0_full
         x0_mid = self.x0_mid_proj(x0_shifted.view(B, T // sf, sf, D).mean(dim=2))
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0_mid)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
+        for _loop in range(int(os.environ.get("MIDDLE_RECURRENCE", "2"))):
+            skips: list[Tensor] = []
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0_mid)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
         x = self.upsample_proj(x).view(B, T, D)
         x = x + skip_full
         for block in self.exit_blocks:
@@ -1197,11 +1198,10 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if bool(int(os.environ.get("USE_QAT", "0"))) and scale < 0.2 and step > 200 and not getattr(base_model, '_qat_enabled', False):
+        if bool(int(os.environ.get("USE_QAT", "0"))) and scale < 0.5 and step > 200 and not getattr(base_model, '_qat_enabled', False):
             for module in base_model.modules():
                 if isinstance(module, CastedLinear): module.use_qat = True
             base_model._qat_enabled = True
-            log0(f"step:{step} QAT enabled")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1274,8 +1274,10 @@ def main() -> None:
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
         del ema_state
+    sd = base_model.state_dict()
+    log0(f"state_dict keys: {len(sd)} total params: {sum(t.numel() for t in sd.values())}")
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
