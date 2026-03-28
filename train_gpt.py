@@ -6,6 +6,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
+from fla.layers import GatedDeltaNet as GDNLayer
 import copy
 import glob
 import io
@@ -65,7 +66,6 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_entry_layers = int(os.environ.get("NUM_ENTRY_LAYERS", 2))
     num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
-    shortening_factor = int(os.environ.get("SHORTENING_FACTOR", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -796,13 +796,17 @@ class CausalConvBlock(nn.Module):
         self.pw_down._zero_init = True
         self.norm = RMSNorm()
         self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.use_qat = False
 
     def forward(self, x: Tensor) -> Tensor:
         residual = x
         x = self.norm(x)
         x = x.transpose(1, 2)
         x = F.pad(x, (self.pad, 0))
-        x = self.dw_conv(x)
+        w = self.dw_conv.weight
+        if self.use_qat and self.training:
+            w = _FakeQuant.apply(w.view(w.size(0), -1), 31).view_as(w)
+        x = F.conv1d(x, w, groups=x.size(1))
         x = x.transpose(1, 2)
         x = self.pw_up(x)
         gate, val = x.chunk(2, dim=-1)
@@ -827,7 +831,6 @@ class GPT(nn.Module):
         qk_gain_init: float,
         num_entry_layers: int = 2,
         num_exit_layers: int = 2,
-        shortening_factor: int = 2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -849,12 +852,15 @@ class GPT(nn.Module):
         _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         self.entry_blocks = nn.ModuleList([CausalConvBlock(model_dim) for _ in range(num_entry_layers)])
         self.dim_up = CastedLinear(model_dim, mid_dim, bias=False) if mid_dim != model_dim else None
-        self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False) if mid_dim != model_dim else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, mid_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList([Block(*_bargs_mid) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([
+            GDNLayer(mode='fused_recurrent', hidden_size=mid_dim, expand_k=1, expand_v=2,
+                     num_heads=4, use_gate=True, use_short_conv=True, conv_size=4)
+            for _ in range(num_layers)
+        ])
         self.dim_down = CastedLinear(mid_dim, model_dim, bias=False) if mid_dim != model_dim else None
         self.exit_blocks = nn.ModuleList([Block(*_bargs_full, use_xsa=True) for _ in range(num_exit_layers)])
         self.final_norm = RMSNorm()
@@ -880,15 +886,16 @@ class GPT(nn.Module):
             x = block(x)
         skip_full = x
         if self.dim_up is not None: x = self.dim_up(x)
-        x0_mid = self.x0_mid_proj(x0_full) if self.x0_mid_proj is not None else x0_full
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0_mid)
+            out = self.blocks[i](x)
+            x = out[0] if isinstance(out, tuple) else out
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
+            out = self.blocks[self.num_encoder_layers + i](x)
+            x = out[0] if isinstance(out, tuple) else out
         x = (self.dim_down(x) if self.dim_down is not None else x) + skip_full
         for block in self.exit_blocks:
             x = block(x, x0_full)
@@ -1019,13 +1026,15 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         num_entry_layers=args.num_entry_layers,
         num_exit_layers=args.num_exit_layers,
-        shortening_factor=args.shortening_factor,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    for module in base_model.blocks.modules():
+        if isinstance(module, nn.Linear) and not isinstance(module, CastedLinear):
+            module.float()
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1038,14 +1047,16 @@ def main() -> None:
         list(base_model.blocks.named_parameters()) +
         list(base_model.exit_blocks.named_parameters())
     )
+    gdn_2d = set(id(p) for p in base_model.blocks.parameters() if p.ndim == 2)
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        and id(p) not in gdn_2d
     ]
+    gdn_matrix_params = [p for p in base_model.blocks.parameters() if p.ndim == 2]
     if base_model.dim_up is not None: matrix_params.append(base_model.dim_up.weight)
     if base_model.dim_down is not None: matrix_params.append(base_model.dim_down.weight)
-    if base_model.x0_mid_proj is not None: matrix_params.append(base_model.x0_mid_proj.weight)
     matrix_params.append(base_model.bigram_hash.proj.weight)
     matrix_params.extend(p for p in base_model.pre_enrich.parameters() if p.ndim == 2)
     scalar_params = [
@@ -1079,6 +1090,9 @@ def main() -> None:
         fused=True,
     )
     conv_params = [b.dw_conv.weight for b in base_model.entry_blocks if hasattr(b, 'dw_conv')]
+    for block in base_model.blocks:
+        for n, p in block.named_parameters():
+            if p.ndim == 3: conv_params.append(p)
     if conv_params:
         optimizer_conv = torch.optim.Adam(
             [{"params": conv_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
@@ -1093,6 +1107,11 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    if gdn_matrix_params:
+        optimizer_gdn = torch.optim.Adam(
+            [{"params": gdn_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
+        optimizers.append(optimizer_gdn)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1212,9 +1231,14 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if bool(int(os.environ.get("USE_QAT", "0"))) and scale < 0.5 and step > 200 and not getattr(base_model, '_qat_enabled', False):
+        if scale < 1.0 and not getattr(base_model, '_conv_frozen', False):
+            for block in base_model.entry_blocks:
+                if hasattr(block, 'dw_conv'): block.dw_conv.weight.requires_grad_(False)
+            base_model._conv_frozen = True
+        if bool(int(os.environ.get("USE_QAT", "0"))) and scale < 0.2 and step > 200 and not getattr(base_model, '_qat_enabled', False):
             for module in base_model.modules():
                 if isinstance(module, CastedLinear): module.use_qat = True
+                if isinstance(module, CausalConvBlock): module.use_qat = True
             for mn, mm in base_model.named_modules():
                 if isinstance(mm, CastedLinear) and ('mlp.fc' in mn or 'mlp.proj' in mn or 'pw_up' in mn or 'pw_down' in mn):
                     mm.qat_clip = 15
