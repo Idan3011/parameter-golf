@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 from pathlib import Path
 
@@ -342,6 +343,42 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        best_q, best_s, best_mse = None, None, float("inf")
+        for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
+            ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
+            s = (ca / 31.0).clamp_min(1.0 / 31.0)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -31, 31)
+            mse = ((q * s[:, None] - t32) ** 2).mean().item()
+            if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
+        return best_q, best_s
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
+    return q, scale
+
+def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+    quantized, scales, dtypes, passthrough, passthrough_orig_dtypes, qmeta = {}, {}, {}, {}, {}, {}
+    stats = dict.fromkeys(("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel()); stats["num_tensors"] += 1; stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1; passthrough[name] = t; stats["int8_payload_bytes"] += tensor_nbytes(t); continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or "tok_emb.weight" in name:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes); passthrough[name] = kept; stats["int8_payload_bytes"] += tensor_nbytes(kept); continue
+        stats["num_float_tensors"] += 1
+        q, s = quantize_float_tensor_int6(t)
+        if s.ndim > 0: qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q; scales[name] = s; dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+    obj: dict[str, object] = {"__quant_format__": "int6_per_row_v1", "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
+    if qmeta: obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes: obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -648,6 +685,31 @@ class Block(nn.Module):
         return x
 
 
+class CausalConvBlock(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 7):
+        super().__init__()
+        self.pad = kernel_size - 1
+        self.dw_conv = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False)
+        self.pw_up = CastedLinear(dim, 2 * dim, bias=False)
+        self.pw_down = CastedLinear(dim, dim, bias=False)
+        self.pw_down._zero_init = True
+        self.norm = RMSNorm()
+        self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        x = self.norm(x)
+        x = x.transpose(1, 2)
+        x = F.pad(x, (self.pad, 0))
+        x = self.dw_conv(x)
+        x = x.transpose(1, 2)
+        x = self.pw_up(x)
+        gate, val = x.chunk(2, dim=-1)
+        x = F.silu(gate) * val
+        x = self.pw_down(x)
+        return residual + self.scale.to(dtype=x.dtype)[None, None, :] * x
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -674,16 +736,20 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.shortening_factor = shortening_factor
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        _bargs = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-        self.entry_blocks = nn.ModuleList([Block(*_bargs) for _ in range(num_entry_layers)])
-        self.downsample_proj = CastedLinear(shortening_factor * model_dim, model_dim, bias=False)
+        mid_dim = int(os.environ.get("MIDDLE_DIM", 768))
+        _bargs_full = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+        _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+        self.entry_blocks = nn.ModuleList([CausalConvBlock(model_dim) for _ in range(num_entry_layers)])
+        self.downsample_proj = CastedLinear(shortening_factor * model_dim, mid_dim, bias=False)
+        self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList([Block(*_bargs) for _ in range(num_layers)])
-        self.upsample_proj = CastedLinear(model_dim, shortening_factor * model_dim, bias=False)
-        self.exit_blocks = nn.ModuleList([Block(*_bargs) for _ in range(num_exit_layers)])
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, mid_dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList([Block(*_bargs_mid) for _ in range(num_layers)])
+        self.upsample_proj = CastedLinear(mid_dim, shortening_factor * model_dim, bias=False)
+        self.upsample_proj._zero_init = True
+        self.exit_blocks = nn.ModuleList([Block(*_bargs_full) for _ in range(num_exit_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -704,12 +770,12 @@ class GPT(nn.Module):
         B, T, D = x.shape
         sf = self.shortening_factor
         for block in self.entry_blocks:
-            x = block(x, x0_full)
+            x = block(x)
         skip_full = x
         x_shifted = F.pad(x[:, :-1, :], (0, 0, 1, 0), value=0.0)
         x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
         x0_shifted = F.pad(x0_full[:, :-1, :], (0, 0, 1, 0), value=0.0)
-        x0_mid = x0_shifted.view(B, T // sf, sf, D).mean(dim=2)
+        x0_mid = self.x0_mid_proj(x0_shifted.view(B, T // sf, sf, D).mean(dim=2))
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0_mid)
@@ -873,6 +939,7 @@ def main() -> None:
     ]
     matrix_params.append(base_model.downsample_proj.weight)
     matrix_params.append(base_model.upsample_proj.weight)
+    matrix_params.append(base_model.x0_mid_proj.weight)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1092,29 +1159,29 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = lzma.compress(quant_raw, preset=6)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.int6.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int6+lzma: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
