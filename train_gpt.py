@@ -281,6 +281,55 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+
+def eval_val_sliding(
+    args, base_model, rank, world_size, device, val_tokens,
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    stride: int = 64, batch_size: int = 64,
+) -> tuple[float, float]:
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel()
+    windows: list[tuple[int, int]] = []
+    pos = 0
+    while pos + seq_len < total_tokens:
+        windows.append((pos, 0 if pos == 0 else seq_len - stride))
+        pos += stride
+    my_windows = windows[rank::world_size]
+    total_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    total_scored_tokens = torch.zeros((), device=device, dtype=torch.float64)
+    total_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    base_model.eval()
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_size):
+            bw = my_windows[bi:bi + batch_size]
+            x_list, y_list = [], []
+            for ws, _ in bw:
+                chunk = val_tokens[ws:ws + seq_len + 1]
+                x_list.append(chunk[:-1]); y_list.append(chunk[1:])
+            x = torch.stack(x_list).to(device=device, dtype=torch.int64)
+            y = torch.stack(y_list).to(device=device, dtype=torch.int64)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base_model.forward_logits(x)
+            ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), seq_len)
+            for idx, (ws, ss) in enumerate(bw):
+                sl = ptl[idx, ss:]
+                total_loss_sum += sl.to(torch.float64).sum()
+                total_scored_tokens += float(sl.numel())
+                sp = x[idx, ss:]; st = y[idx, ss:]
+                tb = base_bytes_lut[st].to(torch.int16)
+                tb += (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)
+                total_byte_count += tb.to(torch.float64).sum()
+    distributed = dist.is_available() and dist.is_initialized()
+    if distributed:
+        dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_scored_tokens, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_byte_count, op=dist.ReduceOp.SUM)
+    val_loss = (total_loss_sum / total_scored_tokens).item()
+    bpb = (total_loss_sum / (total_byte_count * math.log(2.0))).item()
+    base_model.train()
+    return float(val_loss), float(bpb)
+
+
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -546,11 +595,31 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class _FakeQuantInt6(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, w: Tensor) -> Tensor:
+        if w.ndim != 2: return w
+        row_max = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+        scale = row_max / 31.0
+        q = (w / scale).round().clamp(-31, 31)
+        return q * scale
+    @staticmethod
+    def backward(ctx, grad: Tensor) -> Tensor:
+        return grad
+
+def fake_quant_int6(w: Tensor) -> Tensor:
+    return _FakeQuantInt6.apply(w)
+
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_qat = False
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if self.use_qat and self.training:
+            w = fake_quant_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -653,7 +722,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -763,7 +832,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0_full = x
@@ -788,16 +857,18 @@ class GPT(nn.Module):
         x = x + skip_full
         for block in self.exit_blocks:
             x = block(x, x0_full)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids)
+        return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1), reduction="mean")
 
 
 # -----------------------------
@@ -1095,6 +1166,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        if bool(int(os.environ.get("USE_QAT", "0"))) and scale < 0.2 and step > 200 and not getattr(base_model, '_qat_enabled', False):
+            for module in base_model.modules():
+                if isinstance(module, CastedLinear): module.use_qat = True
+            base_model._qat_enabled = True
+            log0(f"step:{step} QAT enabled")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1219,6 +1295,16 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    torch.cuda.synchronize()
+    t_slide = time.perf_counter()
+    sw_val_loss, sw_val_bpb = eval_val_sliding(
+        args, base_model, rank, world_size, device,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(f"final_sliding_window val_bpb:{sw_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
+    log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
