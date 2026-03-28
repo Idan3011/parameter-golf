@@ -6,7 +6,6 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
-from fla.layers import GatedDeltaNet as GDNLayer
 import copy
 import glob
 import io
@@ -56,7 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -81,14 +80,14 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -839,7 +838,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram_hash = BigramHash(2048, 128, model_dim)
+        self.bigram_hash = BigramHash(8192, 128, model_dim)
         self.smear_gate = SmearGate(model_dim)
         pre_enrich_hidden = model_dim * 3 // 2
         self.pre_enrich = nn.Sequential(
@@ -852,15 +851,13 @@ class GPT(nn.Module):
         _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         self.entry_blocks = nn.ModuleList([CausalConvBlock(model_dim) for _ in range(num_entry_layers)])
         self.dim_up = CastedLinear(model_dim, mid_dim, bias=False) if mid_dim != model_dim else None
+        self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False) if mid_dim != model_dim else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, mid_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList([
-            GDNLayer(mode='chunk', hidden_size=mid_dim, expand_k=1, expand_v=2,
-                     num_heads=4, use_gate=True, use_short_conv=True, conv_size=4)
-            for _ in range(num_layers)
-        ])
+        xsa_start = num_layers - 2
+        self.blocks = nn.ModuleList([Block(*_bargs_mid, use_xsa=(i >= xsa_start)) for i in range(num_layers)])
         self.dim_down = CastedLinear(mid_dim, model_dim, bias=False) if mid_dim != model_dim else None
         self.exit_blocks = nn.ModuleList([Block(*_bargs_full, use_xsa=True) for _ in range(num_exit_layers)])
         self.final_norm = RMSNorm()
@@ -886,16 +883,15 @@ class GPT(nn.Module):
             x = block(x)
         skip_full = x
         if self.dim_up is not None: x = self.dim_up(x)
+        x0_mid = self.x0_mid_proj(x0_full) if self.x0_mid_proj is not None else x0_full
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            out = self.blocks[i](x)
-            x = out[0] if isinstance(out, tuple) else out
+            x = self.blocks[i](x, x0_mid)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            out = self.blocks[self.num_encoder_layers + i](x)
-            x = out[0] if isinstance(out, tuple) else out
+            x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
         x = (self.dim_down(x) if self.dim_down is not None else x) + skip_full
         for block in self.exit_blocks:
             x = block(x, x0_full)
@@ -1031,13 +1027,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    for module in base_model.blocks.modules():
-        if isinstance(module, nn.Linear) and not isinstance(module, CastedLinear):
-            module.float()
-    for block in base_model.blocks:
-        block.forward = torch._dynamo.disable(block.forward)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True) if distributed else compiled_model
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1049,16 +1040,14 @@ def main() -> None:
         list(base_model.blocks.named_parameters()) +
         list(base_model.exit_blocks.named_parameters())
     )
-    gdn_2d = set(id(p) for p in base_model.blocks.parameters() if p.ndim == 2)
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        and id(p) not in gdn_2d
     ]
-    gdn_matrix_params = [p for p in base_model.blocks.parameters() if p.ndim == 2]
     if base_model.dim_up is not None: matrix_params.append(base_model.dim_up.weight)
     if base_model.dim_down is not None: matrix_params.append(base_model.dim_down.weight)
+    if base_model.x0_mid_proj is not None: matrix_params.append(base_model.x0_mid_proj.weight)
     matrix_params.append(base_model.bigram_hash.proj.weight)
     matrix_params.extend(p for p in base_model.pre_enrich.parameters() if p.ndim == 2)
     scalar_params = [
@@ -1092,9 +1081,6 @@ def main() -> None:
         fused=True,
     )
     conv_params = [b.dw_conv.weight for b in base_model.entry_blocks if hasattr(b, 'dw_conv')]
-    for block in base_model.blocks:
-        for n, p in block.named_parameters():
-            if p.ndim == 3: conv_params.append(p)
     if conv_params:
         optimizer_conv = torch.optim.Adam(
             [{"params": conv_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
@@ -1109,11 +1095,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-    if gdn_matrix_params:
-        optimizer_gdn = torch.optim.Adam(
-            [{"params": gdn_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
-            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
-        optimizers.append(optimizer_gdn)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
