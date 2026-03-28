@@ -1053,7 +1053,8 @@ def main() -> None:
     training_time_ms = 0.0
     stop_after_step: int | None = None
     ema_decay = float(os.environ.get("EMA_DECAY", "0.997"))
-    ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
+    use_ema = bool(int(os.environ.get("USE_EMA", "0")))
+    ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()} if use_ema else None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1122,9 +1123,10 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
-        with torch.no_grad():
-            for n, p in base_model.named_parameters():
-                ema_state[n].mul_(ema_decay).add_(p.data.float(), alpha=1.0 - ema_decay)
+        if ema_state is not None:
+            with torch.no_grad():
+                for n, p in base_model.named_parameters():
+                    ema_state[n].mul_(ema_decay).add_(p.data.float(), alpha=1.0 - ema_decay)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1156,14 +1158,15 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    log0("ema: loading weights")
-    ema_state = {k: v.cpu() for k, v in ema_state.items()}
-    base_model.load_state_dict(ema_state, strict=True)
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(base_model)
-    del ema_state
+    if ema_state is not None:
+        log0("ema: loading weights")
+        ema_state = {k: v.cpu() for k, v in ema_state.items()}
+        base_model.load_state_dict(ema_state, strict=True)
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+        restore_low_dim_params_to_fp32(base_model)
+        del ema_state
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
