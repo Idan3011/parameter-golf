@@ -739,7 +739,7 @@ class GPT(nn.Module):
         mid_dim = int(os.environ.get("MIDDLE_DIM", 768))
         _bargs_full = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-        self.entry_blocks = nn.ModuleList([CausalConvBlock(model_dim) for _ in range(num_entry_layers)])
+        self.entry_blocks = nn.ModuleList([Block(*_bargs_full) for _ in range(num_entry_layers)])
         self.downsample_proj = CastedLinear(shortening_factor * model_dim, mid_dim, bias=False)
         self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False)
         self.num_encoder_layers = num_layers // 2
@@ -770,7 +770,7 @@ class GPT(nn.Module):
         B, T, D = x.shape
         sf = self.shortening_factor
         for block in self.entry_blocks:
-            x = block(x)
+            x = block(x, x0_full)
         skip_full = x
         x_shifted = F.pad(x[:, :-1, :], (0, 0, 1, 0), value=0.0)
         x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
