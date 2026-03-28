@@ -56,7 +56,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -69,7 +69,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -838,6 +838,12 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash = BigramHash(2048, 128, model_dim)
         self.smear_gate = SmearGate(model_dim)
+        pre_enrich_hidden = model_dim * 3 // 2
+        self.pre_enrich = nn.Sequential(
+            CastedLinear(model_dim, pre_enrich_hidden, bias=False),
+            nn.GELU(),
+            CastedLinear(pre_enrich_hidden, model_dim, bias=False),
+        )
         mid_dim = int(os.environ.get("MIDDLE_DIM", 768))
         _bargs_full = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
@@ -867,6 +873,7 @@ class GPT(nn.Module):
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
         x = self.smear_gate(x)
+        x = self.pre_enrich(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0_full = x
         for block in self.entry_blocks:
@@ -1040,6 +1047,7 @@ def main() -> None:
     matrix_params.append(base_model.dim_down.weight)
     matrix_params.append(base_model.x0_mid_proj.weight)
     matrix_params.append(base_model.bigram_hash.proj.weight)
+    matrix_params.extend(p for p in base_model.pre_enrich.parameters() if p.ndim == 2)
     scalar_params = [
         p
         for name, p in block_named_params
