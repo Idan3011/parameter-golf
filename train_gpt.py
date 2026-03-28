@@ -772,9 +772,9 @@ class GPT(nn.Module):
         for block in self.entry_blocks:
             x = block(x, x0_full)
         skip_full = x
-        x_shifted = F.pad(x[:, :-1, :], (0, 0, 1, 0), value=0.0)
+        x_shifted = F.pad(x[:, :-(sf-1) or T, :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x
         x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
-        x0_shifted = F.pad(x0_full[:, :-1, :], (0, 0, 1, 0), value=0.0)
+        x0_shifted = F.pad(x0_full[:, :-(sf-1) or T, :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x0_full
         x0_mid = self.x0_mid_proj(x0_shifted.view(B, T // sf, sf, D).mean(dim=2))
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
