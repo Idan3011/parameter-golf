@@ -62,6 +62,9 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_entry_layers = int(os.environ.get("NUM_ENTRY_LAYERS", 2))
+    num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
+    shortening_factor = int(os.environ.get("SHORTENING_FACTOR", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -659,6 +662,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_entry_layers: int = 2,
+        num_exit_layers: int = 2,
+        shortening_factor: int = 2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,24 +672,18 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.shortening_factor = shortening_factor
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        _bargs = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+        self.entry_blocks = nn.ModuleList([Block(*_bargs) for _ in range(num_entry_layers)])
+        self.downsample_proj = CastedLinear(shortening_factor * model_dim, model_dim, bias=False)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
-        )
+        self.blocks = nn.ModuleList([Block(*_bargs) for _ in range(num_layers)])
+        self.upsample_proj = CastedLinear(model_dim, shortening_factor * model_dim, bias=False)
+        self.exit_blocks = nn.ModuleList([Block(*_bargs) for _ in range(num_exit_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -700,18 +700,28 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+        x0_full = x
+        B, T, D = x.shape
+        sf = self.shortening_factor
+        for block in self.entry_blocks:
+            x = block(x, x0_full)
+        skip_full = x
+        x_shifted = F.pad(x[:, :-1, :], (0, 0, 1, 0), value=0.0)
+        x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
+        x0_shifted = F.pad(x0_full[:, :-1, :], (0, 0, 1, 0), value=0.0)
+        x0_mid = x0_shifted.view(B, T // sf, sf, D).mean(dim=2)
         skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0_mid)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-
+            x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
+        x = self.upsample_proj(x).view(B, T, D)
+        x = x + skip_full
+        for block in self.exit_blocks:
+            x = block(x, x0_full)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -835,6 +845,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_entry_layers=args.num_entry_layers,
+        num_exit_layers=args.num_exit_layers,
+        shortening_factor=args.shortening_factor,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -848,12 +861,18 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = (
+        list(base_model.entry_blocks.named_parameters()) +
+        list(base_model.blocks.named_parameters()) +
+        list(base_model.exit_blocks.named_parameters())
+    )
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_params.append(base_model.downsample_proj.weight)
+    matrix_params.append(base_model.upsample_proj.weight)
     scalar_params = [
         p
         for name, p in block_named_params
