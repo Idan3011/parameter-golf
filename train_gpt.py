@@ -669,6 +669,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_xsa: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -688,6 +689,7 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = use_xsa
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -708,6 +710,9 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_xsa:
+            vn = F.normalize(v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), dim=-1)
+            y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -735,11 +740,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_xsa: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_xsa=use_xsa)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -753,6 +759,27 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
+
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.full((dim,), 3.0, dtype=torch.float32))
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate).to(dtype=x.dtype)
+        x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
+        return g * x + (1.0 - g) * x_prev
+
+class BigramHash(nn.Module):
+    def __init__(self, num_buckets: int, hash_dim: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.table = nn.Embedding(num_buckets, hash_dim)
+        self.proj = CastedLinear(hash_dim, model_dim, bias=False)
+        nn.init.normal_(self.table.weight, std=0.01)
+    def forward(self, input_ids: Tensor) -> Tensor:
+        prev_ids = torch.cat([torch.zeros_like(input_ids[:, :1]), input_ids[:, :-1]], dim=1)
+        h = ((prev_ids.long() * 92821 + input_ids.long()) % self.num_buckets).long()
+        return self.proj(self.table(h))
 
 class CausalConvBlock(nn.Module):
     def __init__(self, dim: int, kernel_size: int = 7):
@@ -805,10 +832,12 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.shortening_factor = shortening_factor
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram_hash = BigramHash(2048, 128, model_dim)
+        self.smear_gate = SmearGate(model_dim)
         mid_dim = int(os.environ.get("MIDDLE_DIM", 768))
         _bargs_full = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-        self.entry_blocks = nn.ModuleList([Block(*_bargs_full) for _ in range(num_entry_layers)])
+        self.entry_blocks = nn.ModuleList([CausalConvBlock(model_dim) for _ in range(num_entry_layers)])
         self.downsample_proj = CastedLinear(shortening_factor * model_dim, mid_dim, bias=False)
         self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False)
         self.num_encoder_layers = num_layers // 2
@@ -817,8 +846,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, mid_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([Block(*_bargs_mid) for _ in range(num_layers)])
         self.upsample_proj = CastedLinear(mid_dim, shortening_factor * model_dim, bias=False)
-        self.upsample_proj._zero_init = True
-        self.exit_blocks = nn.ModuleList([Block(*_bargs_full) for _ in range(num_exit_layers)])
+        self.exit_blocks = nn.ModuleList([Block(*_bargs_full, use_xsa=True) for _ in range(num_exit_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -833,13 +861,14 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
+        x = self.smear_gate(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0_full = x
         B, T, D = x.shape
         sf = self.shortening_factor
         for block in self.entry_blocks:
-            x = block(x, x0_full)
+            x = block(x)
         skip_full = x
         x_shifted = F.pad(x[:, :-(sf-1) or T, :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x
         x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
@@ -1011,6 +1040,7 @@ def main() -> None:
     matrix_params.append(base_model.downsample_proj.weight)
     matrix_params.append(base_model.upsample_proj.weight)
     matrix_params.append(base_model.x0_mid_proj.weight)
+    matrix_params.extend(p for p in base_model.bigram_hash.parameters() if p.ndim == 2)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1018,6 +1048,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.smear_gate.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
