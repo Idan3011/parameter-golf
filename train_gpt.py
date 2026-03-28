@@ -1214,10 +1214,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if scale < 1.0 and not getattr(base_model, '_conv_frozen', False):
-            for block in base_model.entry_blocks:
-                if hasattr(block, 'dw_conv'): block.dw_conv.weight.requires_grad_(False)
-            base_model._conv_frozen = True
         if bool(int(os.environ.get("USE_QAT", "0"))) and scale < 0.2 and step > 200 and not getattr(base_model, '_qat_enabled', False):
             for module in base_model.modules():
                 if isinstance(module, CastedLinear): module.use_qat = True
