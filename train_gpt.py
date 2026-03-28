@@ -848,14 +848,14 @@ class GPT(nn.Module):
         _bargs_full = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         self.entry_blocks = nn.ModuleList([CausalConvBlock(model_dim) for _ in range(num_entry_layers)])
-        self.dim_up = CastedLinear(model_dim, mid_dim, bias=False)
-        self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False)
+        self.dim_up = CastedLinear(model_dim, mid_dim, bias=False) if mid_dim != model_dim else None
+        self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False) if mid_dim != model_dim else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, mid_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([Block(*_bargs_mid) for _ in range(num_layers)])
-        self.dim_down = CastedLinear(mid_dim, model_dim, bias=False)
+        self.dim_down = CastedLinear(mid_dim, model_dim, bias=False) if mid_dim != model_dim else None
         self.exit_blocks = nn.ModuleList([Block(*_bargs_full, use_xsa=True) for _ in range(num_exit_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -879,8 +879,8 @@ class GPT(nn.Module):
         for block in self.entry_blocks:
             x = block(x)
         skip_full = x
-        x = self.dim_up(x)
-        x0_mid = self.x0_mid_proj(x0_full)
+        if self.dim_up is not None: x = self.dim_up(x)
+        x0_mid = self.x0_mid_proj(x0_full) if self.x0_mid_proj is not None else x0_full
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0_mid)
@@ -889,7 +889,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
-        x = self.dim_down(x) + skip_full
+        x = (self.dim_down(x) if self.dim_down is not None else x) + skip_full
         for block in self.exit_blocks:
             x = block(x, x0_full)
         x = self.final_norm(x)
@@ -1043,9 +1043,9 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    matrix_params.append(base_model.dim_up.weight)
-    matrix_params.append(base_model.dim_down.weight)
-    matrix_params.append(base_model.x0_mid_proj.weight)
+    if base_model.dim_up is not None: matrix_params.append(base_model.dim_up.weight)
+    if base_model.dim_down is not None: matrix_params.append(base_model.dim_down.weight)
+    if base_model.x0_mid_proj is not None: matrix_params.append(base_model.x0_mid_proj.weight)
     matrix_params.append(base_model.bigram_hash.proj.weight)
     matrix_params.extend(p for p in base_model.pre_enrich.parameters() if p.ndim == 2)
     scalar_params = [
