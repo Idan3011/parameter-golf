@@ -141,7 +141,10 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            if not hasattr(self, '_updates_flat') or self._updates_flat.numel() != total_params:
+                self._updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            self._updates_flat.zero_()
+            updates_flat = self._updates_flat
 
             curr = 0
             for i, p in enumerate(params):
@@ -306,8 +309,8 @@ def eval_val_sliding(
             for ws, _ in bw:
                 chunk = val_tokens[ws:ws + seq_len + 1]
                 x_list.append(chunk[:-1]); y_list.append(chunk[1:])
-            x = torch.stack(x_list).to(device=device, dtype=torch.int64)
-            y = torch.stack(y_list).to(device=device, dtype=torch.int64)
+            x = torch.stack(x_list).to(device=device, dtype=torch.int64, non_blocking=True)
+            y = torch.stack(y_list).to(device=device, dtype=torch.int64, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = base_model.forward_logits(x)
             ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), seq_len)
@@ -401,8 +404,8 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
             s = (ca / 31.0).clamp_min(1.0 / 31.0)
             q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -31, 31)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
-            if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
-        return best_q, best_s
+            if mse < best_mse: best_q, best_s, best_mse = q, s, mse
+        return best_q.to(torch.int8).contiguous(), best_s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
@@ -711,8 +714,11 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         if self.use_xsa:
-            vn = F.normalize(v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), dim=-1)
-            y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
+            vn = F.normalize(v, dim=-1)
+            reps = self.num_heads // self.num_kv_heads
+            y_g = y.view(bsz, self.num_kv_heads, reps, seqlen, self.head_dim)
+            dots = (y_g * vn.unsqueeze(2)).sum(-1, keepdim=True)
+            y = (y_g - dots * vn.unsqueeze(2)).view(bsz, self.num_heads, seqlen, self.head_dim)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -831,6 +837,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.shortening_factor = shortening_factor
+        self.middle_recurrence = int(os.environ.get("MIDDLE_RECURRENCE", "2"))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash = BigramHash(2048, 128, model_dim)
         self.smear_gate = SmearGate(model_dim)
@@ -870,11 +877,11 @@ class GPT(nn.Module):
         for block in self.entry_blocks:
             x = block(x)
         skip_full = x
-        x_shifted = F.pad(x[:, :-(sf-1) or T, :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x
+        x_shifted = F.pad(x[:, :T-(sf-1), :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x
         x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
-        x0_shifted = F.pad(x0_full[:, :-(sf-1) or T, :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x0_full
+        x0_shifted = F.pad(x0_full[:, :T-(sf-1), :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x0_full
         x0_mid = self.x0_mid_proj(x0_shifted.view(B, T // sf, sf, D).mean(dim=2))
-        for _loop in range(int(os.environ.get("MIDDLE_RECURRENCE", "2"))):
+        for _loop in range(self.middle_recurrence):
             skips: list[Tensor] = []
             for i in range(self.num_encoder_layers):
                 x = self.blocks[i](x, x0_mid)
@@ -1041,7 +1048,7 @@ def main() -> None:
     matrix_params.append(base_model.downsample_proj.weight)
     matrix_params.append(base_model.upsample_proj.weight)
     matrix_params.append(base_model.x0_mid_proj.weight)
-    matrix_params.extend(p for p in base_model.bigram_hash.parameters() if p.ndim == 2)
+    matrix_params.append(base_model.bigram_hash.proj.weight)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1052,7 +1059,8 @@ def main() -> None:
     scalar_params.append(base_model.smear_gate.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr},
+         {"params": [base_model.bigram_hash.table.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1071,7 +1079,13 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+    conv_params = [b.dw_conv.weight for b in base_model.entry_blocks if hasattr(b, 'dw_conv')]
+    if conv_params:
+        optimizer_conv = torch.optim.Adam(
+            [{"params": conv_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if conv_params: optimizers.append(optimizer_conv)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1162,6 +1176,7 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    train_loss = torch.zeros((), device=device)
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1203,7 +1218,7 @@ def main() -> None:
                 if isinstance(module, CastedLinear): module.use_qat = True
             base_model._qat_enabled = True
         zero_grad_all()
-        train_loss = torch.zeros((), device=device)
+        train_loss.zero_()
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1288,7 +1303,7 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = lzma.compress(quant_raw, preset=6)
+    quant_blob = lzma.compress(quant_raw, preset=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
