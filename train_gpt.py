@@ -395,20 +395,20 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_intN(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         best_q, best_s, best_mse = None, None, float("inf")
         for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
             ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / 31.0).clamp_min(1.0 / 31.0)
-            q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -31, 31)
+            s = (ca / clip_range).clamp_min(1.0 / clip_range)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -clip_range, clip_range)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
             if mse < best_mse: best_q, best_s, best_mse = q, s, mse
         return best_q.to(torch.int8).contiguous(), best_s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / clip_range if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -clip_range, clip_range).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
@@ -422,7 +422,8 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or "tok_emb.weight" in name:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes); passthrough[name] = kept; stats["int8_payload_bytes"] += tensor_nbytes(kept); continue
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int6(t)
+        clip = 15 if ("mlp.fc" in name or "mlp.proj" in name or "pw_up" in name or "pw_down" in name) else 31
+        q, s = quantize_float_tensor_intN(t, clip_range=clip)
         if s.ndim > 0: qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q; scales[name] = s; dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
@@ -598,29 +599,27 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-class _FakeQuantInt6(torch.autograd.Function):
+class _FakeQuant(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w: Tensor) -> Tensor:
+    def forward(ctx, w: Tensor, clip: int) -> Tensor:
         if w.ndim != 2: return w
         row_max = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-        scale = row_max / 31.0
-        q = (w / scale).round().clamp(-31, 31)
+        scale = row_max / clip
+        q = (w / scale).round().clamp(-clip, clip)
         return q * scale
     @staticmethod
-    def backward(ctx, grad: Tensor) -> Tensor:
-        return grad
-
-def fake_quant_int6(w: Tensor) -> Tensor:
-    return _FakeQuantInt6.apply(w)
+    def backward(ctx, grad: Tensor) -> tuple[Tensor, None]:
+        return grad, None
 
 class CastedLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_qat = False
+        self.qat_clip = 31
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self.use_qat and self.training:
-            w = fake_quant_int6(w)
+            w = _FakeQuant.apply(w, self.qat_clip)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -836,8 +835,6 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.shortening_factor = shortening_factor
-        self.middle_recurrence = int(os.environ.get("MIDDLE_RECURRENCE", "2"))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash = BigramHash(2048, 128, model_dim)
         self.smear_gate = SmearGate(model_dim)
@@ -845,14 +842,14 @@ class GPT(nn.Module):
         _bargs_full = (model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         _bargs_mid = (mid_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         self.entry_blocks = nn.ModuleList([CausalConvBlock(model_dim) for _ in range(num_entry_layers)])
-        self.downsample_proj = CastedLinear(shortening_factor * model_dim, mid_dim, bias=False)
+        self.dim_up = CastedLinear(model_dim, mid_dim, bias=False)
         self.x0_mid_proj = CastedLinear(model_dim, mid_dim, bias=False)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, mid_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([Block(*_bargs_mid) for _ in range(num_layers)])
-        self.upsample_proj = CastedLinear(mid_dim, shortening_factor * model_dim, bias=False)
+        self.dim_down = CastedLinear(mid_dim, model_dim, bias=False)
         self.exit_blocks = nn.ModuleList([Block(*_bargs_full, use_xsa=True) for _ in range(num_exit_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -872,26 +869,20 @@ class GPT(nn.Module):
         x = self.smear_gate(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0_full = x
-        B, T, D = x.shape
-        sf = self.shortening_factor
         for block in self.entry_blocks:
             x = block(x)
         skip_full = x
-        x_shifted = F.pad(x[:, :T-(sf-1), :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x
-        x = self.downsample_proj(x_shifted.view(B, T // sf, sf * D))
-        x0_shifted = F.pad(x0_full[:, :T-(sf-1), :], (0, 0, sf-1, 0), value=0.0) if sf > 1 else x0_full
-        x0_mid = self.x0_mid_proj(x0_shifted.view(B, T // sf, sf, D).mean(dim=2))
-        for _loop in range(self.middle_recurrence):
-            skips: list[Tensor] = []
-            for i in range(self.num_encoder_layers):
-                x = self.blocks[i](x, x0_mid)
-                skips.append(x)
-            for i in range(self.num_decoder_layers):
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
-        x = self.upsample_proj(x).view(B, T, D)
-        x = x + skip_full
+        x = self.dim_up(x)
+        x0_mid = self.x0_mid_proj(x0_full)
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0_mid)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0_mid)
+        x = self.dim_down(x) + skip_full
         for block in self.exit_blocks:
             x = block(x, x0_full)
         x = self.final_norm(x)
@@ -1045,8 +1036,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    matrix_params.append(base_model.downsample_proj.weight)
-    matrix_params.append(base_model.upsample_proj.weight)
+    matrix_params.append(base_model.dim_up.weight)
+    matrix_params.append(base_model.dim_down.weight)
     matrix_params.append(base_model.x0_mid_proj.weight)
     matrix_params.append(base_model.bigram_hash.proj.weight)
     scalar_params = [
@@ -1216,6 +1207,9 @@ def main() -> None:
         if bool(int(os.environ.get("USE_QAT", "0"))) and scale < 0.5 and step > 200 and not getattr(base_model, '_qat_enabled', False):
             for module in base_model.modules():
                 if isinstance(module, CastedLinear): module.use_qat = True
+            for mn, mm in base_model.named_modules():
+                if isinstance(mm, CastedLinear) and ('mlp.fc' in mn or 'mlp.proj' in mn or 'pw_up' in mn or 'pw_down' in mn):
+                    mm.qat_clip = 15
             base_model._qat_enabled = True
         zero_grad_all()
         train_loss.zero_()
