@@ -1034,7 +1034,9 @@ def main() -> None:
     for module in base_model.blocks.modules():
         if isinstance(module, nn.Linear) and not isinstance(module, CastedLinear):
             module.float()
-    compiled_model = base_model
+    for block in base_model.blocks:
+        block.forward = torch._dynamo.disable(block.forward)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True) if distributed else compiled_model
 
     # Optimizer split:
