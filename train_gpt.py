@@ -1460,6 +1460,8 @@ def main() -> None:
         log0(f"final_sliding_window val_bpb:{sw_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
         log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
     if ttt_mode > 0:
+        torch._dynamo.reset()
+        base_model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device)
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
