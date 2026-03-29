@@ -87,6 +87,7 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     leaky_relu = bool(int(os.environ.get("LEAKY_RELU", "0")))
+    leaky_relu_slope = float(os.environ.get("LEAKY_RELU_SLOPE", "0.75"))
     crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", "0.01"))
 
 # -----------------------------
@@ -403,7 +404,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
         best_q, best_s, best_mse = None, None, float("inf")
         for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
             ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / 31.0).clamp_min(1.0 / 31.0)
+            s = (ca / 31.0).clamp_min(1e-12)
             q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -31, 31)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
             if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
@@ -766,6 +767,8 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y), v
 
 
+_LEAKY_SLOPE = float(os.environ.get("LEAKY_RELU_SLOPE", "0.75"))
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, leaky: bool = False):
         super().__init__()
@@ -776,7 +779,7 @@ class MLP(nn.Module):
         self._leaky = leaky
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), 0.5) if self._leaky else torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), _LEAKY_SLOPE) if self._leaky else torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -865,7 +868,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+        xsa_last_n = int(os.environ.get("XSA_LAST_N", num_layers))
         mlp_mult_enc = int(os.environ.get("MLP_MULT_ENCODER", mlp_mult))
         mlp_mult_dec = int(os.environ.get("MLP_MULT_DECODER", mlp_mult))
         leaky = bool(int(os.environ.get("LEAKY_RELU", "0")))
