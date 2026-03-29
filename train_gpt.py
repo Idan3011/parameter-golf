@@ -31,12 +31,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 _RUN_CONFIG = os.environ.get("RUN_CONFIG", "A")
 
 class Hyperparameters:
@@ -311,8 +305,6 @@ def eval_val_sliding(
     num_batches = (len(my_windows) + batch_size - 1) // batch_size
     with torch.inference_mode():
         for batch_start in range(0, len(my_windows), batch_size):
-            if batch_start % (batch_size * 500) == 0:
-                print(f"  sliding batch {batch_start // batch_size}/{num_batches}", flush=True)
             batch_windows = my_windows[batch_start:batch_start + batch_size]
             x_list, y_list = [], []
             for win_start, _ in batch_windows:
@@ -398,7 +390,95 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-_QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "15"))
+_QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
+
+def gptq_collect_hessians(model, val_tokens, seq_len, device, n_batches=256):
+    hessians: dict[str, Tensor] = {}
+    hooks = []
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear) and module.weight.ndim == 2:
+            cols = module.weight.shape[1]
+            hessians[name] = torch.zeros(cols, cols, dtype=torch.float32, device=device)
+    def make_hook(name):
+        def fn(mod, inp, out):
+            x = inp[0].detach().float()
+            if x.ndim == 3: x = x.reshape(-1, x.shape[-1])
+            hessians[name] += x.t() @ x
+        return fn
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear) and module.weight.ndim == 2:
+            hooks.append(module.register_forward_hook(make_hook(name)))
+    model.eval()
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        pos = 0
+        for _ in range(n_batches):
+            if pos + seq_len + 1 > val_tokens.numel(): pos = 0
+            x = val_tokens[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+            model.forward_logits(x)
+            pos += seq_len
+    for h in hooks: h.remove()
+    damp_factor = 0.003 if float(os.environ.get("CROWNQ_LAMBDA", "0")) > 0 else 0.01
+    for name in hessians:
+        hessians[name] /= n_batches
+        damp = damp_factor * hessians[name].diag().mean().clamp_min(1e-6)
+        hessians[name].diagonal().add_(damp)
+    return hessians
+
+def gptq_quantize_weight(W: Tensor, H: Tensor, clip: int = 31, block_size: int = 128) -> tuple[Tensor, Tensor]:
+    W = W.float().clone()
+    rows, cols = W.shape
+    dead = H.diag() == 0
+    H[dead, dead] = 1
+    perm = torch.argsort(H.diag(), descending=True)
+    invperm = torch.argsort(perm)
+    W = W[:, perm]
+    W[:, dead[perm]] = 0
+    H = H[perm][:, perm]
+    try:
+        Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
+    except torch.linalg.LinAlgError:
+        W = W[:, invperm]
+        return quantize_float_tensor_int6(W)
+    best_q, best_s, best_err = None, None, float("inf")
+    for pct in [0.999, 0.9995, 0.9999, 0.99999, 1.0]:
+        row_clip = torch.quantile(W.abs(), pct, dim=1) if pct < 1.0 else W.abs().amax(dim=1)
+        s = (row_clip / clip).clamp_min(1e-12).to(torch.float16)
+        sf = s.float()
+        Q = torch.zeros(rows, cols, dtype=torch.int8)
+        W_work = W.clone()
+        for i1 in range(0, cols, block_size):
+            i2 = min(i1 + block_size, cols)
+            W_blk = W_work[:, i1:i2].clone()
+            Hinv_blk = Hinv[i1:i2, i1:i2]
+            Err = torch.zeros(rows, i2 - i1, device=W.device)
+            for j in range(i2 - i1):
+                w_col = W_blk[:, j]
+                q_col = torch.clamp(torch.round(w_col / sf), -clip, clip)
+                Q[:, i1 + j] = q_col.to(torch.int8)
+                err = (w_col - q_col.float() * sf) / Hinv_blk[j, j].clamp_min(1e-12)
+                Err[:, j] = err
+                W_blk[:, j:] -= err.unsqueeze(1) * Hinv_blk[j, j:].unsqueeze(0)
+            if i2 < cols:
+                W_work[:, i2:] -= Err @ Hinv[i1:i2, i2:]
+        recon = Q.float() * sf[:, None]
+        mse = (W - recon).pow(2).mean().item()
+        if mse < best_err: best_q, best_s, best_err = Q, s, mse
+    return best_q[:, invperm].contiguous(), best_s.contiguous()
+
+def ar_selfgen_calibration(model, seq_len, device, n_seqs=64, temperature=0.8):
+    model.eval()
+    tokens = []
+    with torch.inference_mode():
+        for _ in range(n_seqs):
+            x = torch.randint(0, 1024, (1, 1), device=device, dtype=torch.int64)
+            seq = [x]
+            for _ in range(seq_len - 1):
+                logits = model.forward_logits(torch.cat(seq, dim=1))
+                probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+                x = torch.multinomial(probs, 1)
+                seq.append(x)
+            tokens.append(torch.cat(seq, dim=1).squeeze(0))
+    return torch.cat(tokens)
 
 def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     clip = _QUANT_CLIP
@@ -417,7 +497,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -clip, clip).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -444,7 +524,10 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int6(t)
+        if gptq_results is not None and name in gptq_results:
+            q, s = gptq_results[name]
+        else:
+            q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -1343,7 +1426,23 @@ def main() -> None:
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
             log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
+        use_gptq = bool(int(os.environ.get("USE_GPTQ", "0")))
+        gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None
+        if use_gptq:
+            log0("gptq:generating calibration data")
+            calib_tokens = ar_selfgen_calibration(base_model, args.train_seq_len, device)
+            log0(f"gptq:collecting hessians ({calib_tokens.numel()} tokens)")
+            gptq_H = gptq_collect_hessians(base_model, calib_tokens, args.train_seq_len, device)
+            log0(f"gptq:quantizing {len(gptq_H)} layers")
+            gptq_results = {}
+            for gname, H in gptq_H.items():
+                key = gname + ".weight"
+                sd = base_model.state_dict()
+                if key in sd and sd[key].ndim == 2 and "pre_enrich" not in key:
+                    q, s = gptq_quantize_weight(sd[key].to(H.device), H.clone(), clip=_QUANT_CLIP)
+                    gptq_results[key] = (q.cpu(), s.cpu())
+            log0(f"gptq:done layers={len(gptq_results)}")
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), gptq_results=gptq_results)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
@@ -1379,7 +1478,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-
     torch.cuda.synchronize()
     t_slide = time.perf_counter()
     sw_val_loss, sw_val_bpb = eval_val_sliding(
@@ -1395,7 +1493,6 @@ def main() -> None:
 
     if distributed:
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
