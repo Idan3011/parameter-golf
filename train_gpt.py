@@ -336,19 +336,23 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bpb)
 
-def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs):
+def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1):
+    seqs = list(range(0, chunk.numel() - seq_len - 1, seq_len))
+    distributed = dist.is_available() and dist.is_initialized()
     for _ in range(n_epochs):
-        pos = 0
-        while pos + seq_len < chunk.numel() - 1:
+        my_seqs = seqs[rank::world_size]
+        for pos in my_seqs:
             x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
             y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = F.cross_entropy(model.forward_logits(x).float().reshape(-1, vocab_size), y.reshape(-1))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-            opt.step()
-            opt.zero_grad()
-            pos += seq_len
+            (loss / world_size).backward()
+        if distributed:
+            for p in model.parameters():
+                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+        opt.step()
+        opt.zero_grad()
 
 def eval_val_ttt(
     args, base_model, rank, world_size, device, val_tokens,
@@ -409,10 +413,10 @@ def eval_val_ttt(
         if ci < len(chunk_starts) - 1:
             base_model.train()
             if combo:
-                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_pe, epochs_pe)
-                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_full, epochs_full)
+                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_pe, epochs_pe, rank, world_size)
+                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_full, epochs_full, rank, world_size)
             else:
-                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt, epochs_pe if pe_only else epochs_full)
+                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt, epochs_pe if pe_only else epochs_full, rank, world_size)
             if ema_state is not None:
                 with torch.no_grad():
                     for n, p in base_model.named_parameters():
