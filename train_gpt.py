@@ -88,6 +88,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", 0.01))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1230,6 +1231,16 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            if args.crownq_lambda > 0 and scale < 1.0 and micro_step == grad_accum_steps - 1:
+                crownq_pen = torch.zeros((), device=device)
+                for m in base_model.modules():
+                    if isinstance(m, CastedLinear) and m.weight.ndim == 2:
+                        w = m.weight.float()
+                        row_max = w.abs().amax(dim=1).clamp_min(1e-12)
+                        delta = row_max / 15.0
+                        h_proxy = (w ** 2).mean(dim=1)
+                        crownq_pen = crownq_pen + (h_proxy * delta * delta / 12.0).sum()
+                loss = loss + args.crownq_lambda * crownq_pen
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
