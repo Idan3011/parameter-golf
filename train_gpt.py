@@ -839,7 +839,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram_hash = BigramHash(4096, 128, model_dim)
+        self.bigram_hash = BigramHash(2048, 128, model_dim)
         self.smear_gate = SmearGate(model_dim)
         pre_enrich_hidden = model_dim * 3 // 2
         self.pre_enrich = nn.Sequential(
