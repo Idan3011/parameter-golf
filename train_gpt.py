@@ -357,7 +357,7 @@ def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, r
 def eval_val_ttt(
     args, base_model, rank, world_size, device, val_tokens,
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    ttt_mode=1, stride=64, chunk_tokens=131072, log_fn=None,
+    ttt_mode=1, stride=64, chunk_tokens=int(os.environ.get("TTT_CHUNK_TOKENS", "2097152")), log_fn=None,
 ):
     seq_len, vocab = args.train_seq_len, args.vocab_size
     total_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
