@@ -336,18 +336,24 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bpb)
 
-def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1):
+def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1, batch_size=64):
     seqs = list(range(0, chunk.numel() - seq_len - 1, seq_len))
+    my_seqs = seqs[rank::world_size]
+    distributed = dist.is_available() and dist.is_initialized()
     for _ in range(n_epochs):
-        for pos in seqs:
-            x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
-            y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
+        for bi in range(0, len(my_seqs), batch_size):
+            bp = my_seqs[bi:bi + batch_size]
+            x = torch.stack([chunk[p:p + seq_len] for p in bp]).to(device=device, dtype=torch.int64)
+            y = torch.stack([chunk[p + 1:p + seq_len + 1] for p in bp]).to(device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = F.cross_entropy(model.forward_logits(x).float().reshape(-1, vocab_size), y.reshape(-1))
             loss.backward()
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-            opt.step()
-            opt.zero_grad()
+        if distributed:
+            for p in model.parameters():
+                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+        opt.step()
+        opt.zero_grad()
 
 def eval_val_ttt(
     args, base_model, rank, world_size, device, val_tokens,
