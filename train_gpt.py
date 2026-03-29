@@ -392,6 +392,19 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 
 _QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
 
+def pack_int6(q: Tensor) -> bytes:
+    d = (q.flatten().to(torch.int8) + _QUANT_CLIP).numpy().astype(np.uint8)
+    pad = (4 - len(d) % 4) % 4
+    if pad: d = np.pad(d, (0, pad))
+    a, b, c, e = d[0::4], d[1::4], d[2::4], d[3::4]
+    return np.stack([(a << 2) | (b >> 4), ((b & 0xF) << 4) | (c >> 2), ((c & 0x3) << 6) | e], axis=1).tobytes()
+
+def unpack_int6(data: bytes, n: int) -> Tensor:
+    raw = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3)
+    a, b, c = raw[:, 0], raw[:, 1], raw[:, 2]
+    vals = np.stack([a >> 2, ((a & 3) << 4) | (b >> 4), ((b & 0xF) << 2) | (c >> 6), c & 0x3F], axis=1).flatten()[:n]
+    return torch.tensor(vals, dtype=torch.int8) - _QUANT_CLIP
+
 def gptq_collect_hessians(model, val_tokens, seq_len, device, n_batches=256):
     hessians: dict[str, Tensor] = {}
     hooks = []
@@ -425,60 +438,44 @@ def gptq_collect_hessians(model, val_tokens, seq_len, device, n_batches=256):
     return hessians
 
 def gptq_quantize_weight(W: Tensor, H: Tensor, clip: int = 31, block_size: int = 128) -> tuple[Tensor, Tensor]:
-    W = W.float().clone()
-    rows, cols = W.shape
+    W_orig = W.float().clone()
+    rows, cols = W_orig.shape
     dead = H.diag() == 0
     H[dead, dead] = 1
     perm = torch.argsort(H.diag(), descending=True)
     invperm = torch.argsort(perm)
-    W = W[:, perm]
+    W = W_orig[:, perm].clone()
     W[:, dead[perm]] = 0
     H = H[perm][:, perm]
     try:
         Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
     except torch.linalg.LinAlgError:
-        W = W[:, invperm]
-        return quantize_float_tensor_int6(W)
+        return quantize_float_tensor_int6(W_orig)
+    s_amax = (W.abs().amax(dim=1) / clip).clamp_min(1e-12)
+    W_gptq = W.clone()
+    for i1 in range(0, cols, block_size):
+        i2 = min(i1 + block_size, cols)
+        W_blk = W_gptq[:, i1:i2].clone()
+        Hinv_blk = Hinv[i1:i2, i1:i2]
+        Err = torch.zeros(rows, i2 - i1, device=W.device)
+        for j in range(i2 - i1):
+            w_col = W_blk[:, j]
+            q_col = torch.clamp(torch.round(w_col / s_amax), -clip, clip)
+            err = (w_col - q_col.float() * s_amax) / Hinv_blk[j, j].clamp_min(1e-12)
+            Err[:, j] = err
+            W_blk[:, j:] -= err.unsqueeze(1) * Hinv_blk[j, j:].unsqueeze(0)
+        W_gptq[:, i1:i2] = W_blk
+        if i2 < cols:
+            W_gptq[:, i2:] -= Err @ Hinv[i1:i2, i2:]
     best_q, best_s, best_err = None, None, float("inf")
     for pct in [0.999, 0.9995, 0.9999, 0.99999, 1.0]:
-        row_clip = torch.quantile(W.abs(), pct, dim=1) if pct < 1.0 else W.abs().amax(dim=1)
+        row_clip = torch.quantile(W_gptq.abs(), pct, dim=1) if pct < 1.0 else W_gptq.abs().amax(dim=1)
         s = (row_clip / clip).clamp_min(1e-12).to(torch.float16)
-        sf = s.float()
-        Q = torch.zeros(rows, cols, dtype=torch.int8)
-        W_work = W.clone()
-        for i1 in range(0, cols, block_size):
-            i2 = min(i1 + block_size, cols)
-            W_blk = W_work[:, i1:i2].clone()
-            Hinv_blk = Hinv[i1:i2, i1:i2]
-            Err = torch.zeros(rows, i2 - i1, device=W.device)
-            for j in range(i2 - i1):
-                w_col = W_blk[:, j]
-                q_col = torch.clamp(torch.round(w_col / sf), -clip, clip)
-                Q[:, i1 + j] = q_col.to(torch.int8)
-                err = (w_col - q_col.float() * sf) / Hinv_blk[j, j].clamp_min(1e-12)
-                Err[:, j] = err
-                W_blk[:, j:] -= err.unsqueeze(1) * Hinv_blk[j, j:].unsqueeze(0)
-            if i2 < cols:
-                W_work[:, i2:] -= Err @ Hinv[i1:i2, i2:]
-        recon = Q.float() * sf[:, None]
-        mse = (W - recon).pow(2).mean().item()
-        if mse < best_err: best_q, best_s, best_err = Q, s, mse
+        q = torch.clamp(torch.round(W_gptq / s.float()[:, None]), -clip, clip).to(torch.int8)
+        mse = (W - q.float() * s.float()[:, None]).pow(2).mean().item()
+        if mse < best_err: best_q, best_s, best_err = q, s, mse
     return best_q[:, invperm].contiguous(), best_s.contiguous()
 
-def ar_selfgen_calibration(model, seq_len, device, n_seqs=64, temperature=0.8):
-    model.eval()
-    tokens = []
-    with torch.inference_mode():
-        for _ in range(n_seqs):
-            x = torch.randint(0, 1024, (1, 1), device=device, dtype=torch.int64)
-            seq = [x]
-            for _ in range(seq_len - 1):
-                logits = model.forward_logits(torch.cat(seq, dim=1))
-                probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
-                x = torch.multinomial(probs, 1)
-                seq.append(x)
-            tokens.append(torch.cat(seq, dim=1).squeeze(0))
-    return torch.cat(tokens)
 
 def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     clip = _QUANT_CLIP
@@ -530,12 +527,15 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[s
             q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
+        packed = pack_int6(q)
+        quantized[name] = packed
+        qmeta.setdefault(name, {})["shape"] = list(q.shape)
+        qmeta[name]["numel"] = int(q.numel())
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        stats["int8_payload_bytes"] += len(packed) + tensor_nbytes(s)
     obj: dict[str, object] = {
-        "__quant_format__": "int6_per_row_v1",
+        "__quant_format__": "int6_packed_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -548,42 +548,15 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[s
     return obj, stats
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
-        0,
-    )
-
+    quantized, scales, dtypes, passthrough, passthrough_orig_dtypes, qmeta = {}, {}, {}, {}, {}, {}
+    stats = dict.fromkeys(("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-
+        stats["param_count"] += int(t.numel()); stats["num_tensors"] += 1; stats["baseline_tensor_bytes"] += tensor_nbytes(t)
         if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
-            continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
+            stats["num_nonfloat_tensors"] += 1; passthrough[name] = t; stats["int8_payload_bytes"] += tensor_nbytes(t); continue
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            continue
-
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes); passthrough[name] = kept; stats["int8_payload_bytes"] += tensor_nbytes(kept); continue
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor(t)
         if s.ndim > 0:
@@ -609,19 +582,22 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
+    packed = obj.get("__quant_format__", "").startswith("int6_packed")
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
+    for name, q_data in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        meta = qmeta.get(name, {})
+        if packed and isinstance(q_data, bytes):
+            q = unpack_int6(q_data, meta["numel"]).reshape(meta["shape"])
+        else:
+            q = q_data
+        if meta.get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -1429,15 +1405,13 @@ def main() -> None:
         use_gptq = bool(int(os.environ.get("USE_GPTQ", "0")))
         gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None
         if use_gptq:
-            log0("gptq:generating calibration data")
-            calib_tokens = ar_selfgen_calibration(base_model, args.train_seq_len, device)
-            log0(f"gptq:collecting hessians ({calib_tokens.numel()} tokens)")
-            gptq_H = gptq_collect_hessians(base_model, calib_tokens, args.train_seq_len, device)
+            log0("gptq:collecting hessians")
+            gptq_H = gptq_collect_hessians(base_model, val_tokens, args.train_seq_len, device)
             log0(f"gptq:quantizing {len(gptq_H)} layers")
             gptq_results = {}
+            sd = base_model.state_dict()
             for gname, H in gptq_H.items():
                 key = gname + ".weight"
-                sd = base_model.state_dict()
                 if key in sd and sd[key].ndim == 2 and "pre_enrich" not in key:
                     q, s = gptq_quantize_weight(sd[key].to(H.device), H.clone(), clip=_QUANT_CLIP)
                     gptq_results[key] = (q.cpu(), s.cpu())
