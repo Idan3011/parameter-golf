@@ -413,7 +413,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -440,10 +440,7 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[s
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        if gptq_results is not None and name in gptq_results:
-            q, s = gptq_results[name]
-        else:
-            q, s = quantize_float_tensor_int6(t)
+        q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -462,48 +459,6 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[s
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
-
-def collect_gptq_hessians(model, val_tokens, seq_len, device, n_batches=256):
-    hessians: dict[str, Tensor] = {}
-    def make_hook(name):
-        def fn(mod, inp, out):
-            x = inp[0].float().reshape(-1, inp[0].size(-1))
-            hessians.setdefault(name, torch.zeros(x.size(1), x.size(1), device=device)).addmm_(x.t(), x)
-        return fn
-    hooks = [m.register_forward_hook(make_hook(n)) for n, m in model.named_modules() if isinstance(m, CastedLinear) and m.weight.ndim == 2]
-    model.eval()
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        pos = 0
-        for _ in range(n_batches):
-            if pos + seq_len + 1 > val_tokens.numel(): pos = 0
-            x = val_tokens[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
-            model.forward_logits(x)
-            pos += seq_len
-    for h in hooks: h.remove()
-    for n in hessians: hessians[n] /= (n_batches * seq_len)
-    return hessians
-
-def gptq_quantize_tensor(W: Tensor, H: Tensor, clip: int = 31, blocksize: int = 128, percdamp: float = 0.01) -> tuple[Tensor, Tensor]:
-    W = W.float().clone()
-    _, nc = W.shape
-    damp = percdamp * H.diag().mean()
-    Hinv = torch.linalg.inv(H + damp * torch.eye(nc, device=H.device))
-    row_max = W.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-    scale = row_max / clip
-    for ci in range(0, nc, blocksize):
-        ce = min(ci + blocksize, nc)
-        Hinv1 = Hinv[ci:ce, ci:ce]
-        for i in range(ce - ci):
-            col = ci + i
-            w = W[:, col]
-            d = Hinv1[i, i].clamp_min(1e-12)
-            q = (w / scale.squeeze()).round().clamp(-clip, clip) * scale.squeeze()
-            err = (w - q) / d
-            W[:, col] = q
-            if i + 1 < ce - ci:
-                W[:, col + 1:ce] -= err.unsqueeze(1) * Hinv1[i, i + 1:].unsqueeze(0)
-    q_int = (W / scale).round().clamp(-clip, clip).to(torch.int8)
-    return q_int.contiguous(), scale.squeeze().to(torch.float16).contiguous()
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
