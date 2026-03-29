@@ -336,13 +336,26 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bpb)
 
+def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs):
+    for _ in range(n_epochs):
+        pos = 0
+        while pos + seq_len < chunk.numel() - 1:
+            x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+            y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = F.cross_entropy(model.forward_logits(x).float().reshape(-1, vocab_size), y.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+            opt.step()
+            opt.zero_grad()
+            pos += seq_len
+
 def eval_val_ttt(
     args, base_model, rank, world_size, device, val_tokens,
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     ttt_mode=1, stride=64, chunk_tokens=131072, log_fn=None,
 ):
-    seq_len = args.train_seq_len
-    total_tokens = val_tokens.numel()
+    seq_len, vocab = args.train_seq_len, args.vocab_size
     total_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     total_scored_tokens = torch.zeros((), device=device, dtype=torch.float64)
     total_byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -369,17 +382,19 @@ def eval_val_ttt(
         for i in range(freeze_blocks):
             for p in base_model.blocks[i].parameters(): p.requires_grad_(False)
         ttt_opt_pe = torch.optim.AdamW(base_model.pre_enrich.parameters(), lr=lr_pe, weight_decay=0.01)
-        ttt_opt_full = torch.optim.AdamW([p for p in base_model.parameters() if p.requires_grad], lr=lr_full, weight_decay=0.01)
+        pe_ids = {id(p) for p in base_model.pre_enrich.parameters()}
+        ttt_opt_full = torch.optim.AdamW([p for p in base_model.parameters() if p.requires_grad and id(p) not in pe_ids], lr=lr_full, weight_decay=0.01)
     ema_state = {n: p.data.clone() for n, p in base_model.named_parameters() if p.requires_grad} if use_ema or combo else None
-    chunk_starts = list(range(0, total_tokens - seq_len - 1, chunk_tokens))
+    chunk_starts = list(range(0, val_tokens.numel() - seq_len - 1, chunk_tokens))
     for ci, cs in enumerate(chunk_starts):
-        ce = min(cs + chunk_tokens + seq_len, total_tokens - 1)
-        chunk = val_tokens[cs:ce + 1]
+        chunk = val_tokens[cs:min(cs + chunk_tokens + seq_len, val_tokens.numel() - 1) + 1]
         base_model.eval()
         with torch.inference_mode():
-            pos = 0
+            windows, pos = [], 0
             while pos + seq_len < chunk.numel() - 1:
-                ss = 0 if pos == 0 else seq_len - stride
+                windows.append((pos, 0 if pos == 0 else seq_len - stride))
+                pos += stride
+            for pos, ss in windows[rank::world_size]:
                 x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
                 y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -391,26 +406,13 @@ def eval_val_ttt(
                 sp, st = x.squeeze(0)[ss:], y.squeeze(0)[ss:]
                 tb = base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)
                 total_byte_count += tb.to(torch.float64).sum()
-                pos += stride
         if ci < len(chunk_starts) - 1:
             base_model.train()
-            def _ttt_train(opt, n_epochs):
-                for _ in range(n_epochs):
-                    pos = 0
-                    while pos + seq_len < chunk.numel() - 1:
-                        x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
-                        y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss = F.cross_entropy(base_model.forward_logits(x).float().reshape(-1, args.vocab_size), y.reshape(-1))
-                        loss.backward()
-                        opt.step()
-                        opt.zero_grad()
-                        pos += seq_len
             if combo:
-                _ttt_train(ttt_opt_pe, epochs_pe)
-                _ttt_train(ttt_opt_full, epochs_full)
+                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_pe, epochs_pe)
+                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_full, epochs_full)
             else:
-                _ttt_train(ttt_opt, epochs_pe if pe_only else epochs_full)
+                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt, epochs_pe if pe_only else epochs_full)
             if ema_state is not None:
                 with torch.no_grad():
                     for n, p in base_model.named_parameters():
