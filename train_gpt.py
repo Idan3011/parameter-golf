@@ -310,8 +310,6 @@ def eval_val_sliding(
     num_batches = (len(my_windows) + batch_size - 1) // batch_size
     with torch.inference_mode():
         for batch_start in range(0, len(my_windows), batch_size):
-            if batch_start % (batch_size * 500) == 0:
-                print(f"  sliding batch {batch_start // batch_size}/{num_batches}", flush=True)
             batch_windows = my_windows[batch_start:batch_start + batch_size]
             x_list, y_list = [], []
             for win_start, _ in batch_windows:
