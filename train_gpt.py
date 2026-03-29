@@ -880,6 +880,7 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.mtp_head = CastedLinear(model_dim * 2, vocab_size, bias=False) if bool(int(os.environ.get("MTP", "0"))) else None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -922,10 +923,15 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         x = self._run_blocks(x, x0)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        logits = self._compute_logits(x)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        x = self.final_norm(x)
+        logits = self._compute_logits(x.reshape(-1, x.size(-1)))
+        loss = F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
+        if self.mtp_head is not None and self.training:
+            h_cat = torch.cat([x[:, :-1, :], x[:, 1:, :]], dim=-1)
+            mtp_logits = self.mtp_head(h_cat).float().reshape(-1, logits.size(-1))
+            mtp_targets = target_ids[:, 1:].reshape(-1)
+            loss = loss + 0.3 * F.cross_entropy(mtp_logits, mtp_targets, reduction="mean")
+        return loss
 
     def forward_logits(self, input_ids: Tensor, return_pe_delta: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
