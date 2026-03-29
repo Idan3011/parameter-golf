@@ -393,18 +393,22 @@ def eval_val_ttt(
             while pos + seq_len < chunk.numel() - 1:
                 windows.append((pos, 0 if pos == 0 else seq_len - stride))
                 pos += stride
-            for pos, ss in windows[rank::world_size]:
-                x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
-                y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
+            my_windows = windows[rank::world_size]
+            score_bs = 256
+            for bi in range(0, len(my_windows), score_bs):
+                bw = my_windows[bi:bi + score_bs]
+                x = torch.stack([chunk[wp:wp + seq_len] for wp, _ in bw]).to(device=device, dtype=torch.int64)
+                y = torch.stack([chunk[wp + 1:wp + seq_len + 1] for wp, _ in bw]).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x)
-                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none")
-                sl = ptl[ss:]
-                total_loss_sum += sl.to(torch.float64).sum()
-                total_scored_tokens += float(sl.numel())
-                sp, st = x.squeeze(0)[ss:], y.squeeze(0)[ss:]
-                tb = base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)
-                total_byte_count += tb.to(torch.float64).sum()
+                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), seq_len)
+                for idx, (_, ss) in enumerate(bw):
+                    sl = ptl[idx, ss:]
+                    total_loss_sum += sl.to(torch.float64).sum()
+                    total_scored_tokens += float(sl.numel())
+                    sp, st = x[idx, ss:], y[idx, ss:]
+                    tb = base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)
+                    total_byte_count += tb.to(torch.float64).sum()
         if ci < len(chunk_starts) - 1:
             for m in base_model.modules():
                 if hasattr(m, '_cos_cached'): m._cos_cached = None; m._sin_cached = None
