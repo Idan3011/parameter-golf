@@ -1379,23 +1379,10 @@ def main() -> None:
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
         del ema_state
-        log0("gptq:collecting hessians")
-        gptq_H = collect_gptq_hessians(base_model, val_tokens, args.train_seq_len, device)
-        log0(f"gptq:hessians collected layers={len(gptq_H)}")
-        gptq_results: dict[str, tuple[Tensor, Tensor]] = {}
-        sd = base_model.state_dict()
-        for gname, H in gptq_H.items():
-            key = gname + ".weight"
-            if key in sd and sd[key].ndim == 2:
-                q, s = gptq_quantize_tensor(sd[key].to(H.device), H)
-                gptq_results[key] = (q.cpu(), s.cpu())
-                sd[key] = (q.float() * s[:, None]).cpu()
-        base_model.load_state_dict(sd, strict=True)
-        log0(f"gptq:quantized {len(gptq_results)} layers")
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
             log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), gptq_results=gptq_results)
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
