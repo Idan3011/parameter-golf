@@ -411,6 +411,8 @@ def eval_val_ttt(
                 tb = base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)
                 total_byte_count += tb.to(torch.float64).sum()
         if ci < len(chunk_starts) - 1:
+            for m in base_model.modules():
+                if hasattr(m, '_cos_cached'): m._cos_cached = None; m._sin_cached = None
             base_model.train()
             if combo:
                 _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_pe, epochs_pe, rank, world_size)
@@ -423,8 +425,9 @@ def eval_val_ttt(
                         if n in ema_state:
                             ema_state[n].mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
                             p.data.copy_(ema_state[n])
-        if log_fn and ci % 10 == 0:
-            log_fn(f"ttt:mode={ttt_mode} chunk={ci}/{len(chunk_starts)}")
+        if log_fn and (ci % 10 == 0 or ci < 3):
+            cur_bpb = (total_loss_sum / (total_byte_count * math.log(2.0))).item() if total_byte_count > 0 else 0
+            log_fn(f"ttt:mode={ttt_mode} chunk={ci}/{len(chunk_starts)} running_bpb={cur_bpb:.4f}")
     distributed = dist.is_available() and dist.is_initialized()
     if distributed:
         dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
