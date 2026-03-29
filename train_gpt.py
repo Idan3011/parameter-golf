@@ -336,17 +336,19 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bpb)
 
-def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1):
+def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1, batch_size=32):
     seqs = list(range(0, chunk.numel() - seq_len - 1, seq_len))
     distributed = dist.is_available() and dist.is_initialized()
     for _ in range(n_epochs):
         my_seqs = seqs[rank::world_size]
-        for pos in my_seqs:
-            x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
-            y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
+        for bi in range(0, len(my_seqs), batch_size):
+            batch_pos = my_seqs[bi:bi + batch_size]
+            x = torch.stack([chunk[p:p + seq_len] for p in batch_pos]).to(device=device, dtype=torch.int64)
+            y = torch.stack([chunk[p + 1:p + seq_len + 1] for p in batch_pos]).to(device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = F.cross_entropy(model.forward_logits(x).float().reshape(-1, vocab_size), y.reshape(-1))
-            (loss / world_size).backward()
+                logits = model.forward_logits(x)
+                loss = F.cross_entropy(logits.float().reshape(-1, vocab_size), y.reshape(-1))
+            (loss / max(len(my_seqs) // batch_size, 1)).backward()
         if distributed:
             for p in model.parameters():
                 if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -366,10 +368,10 @@ def eval_val_ttt(
     pe_only = ttt_mode in (2, 3)
     use_ema = ttt_mode in (3, 4)
     combo = ttt_mode == 5
-    epochs_full = 3
-    epochs_pe = 10
-    lr_full = 0.0001
-    lr_pe = 0.0003
+    epochs_full = int(os.environ.get("TTT_EPOCHS", "1"))
+    epochs_pe = int(os.environ.get("TTT_EPOCHS_PE", "3"))
+    lr_full = float(os.environ.get("TTT_LR", "0.00001"))
+    lr_pe = float(os.environ.get("TTT_LR_PE", "0.0001"))
     ema_decay = 0.998
     freeze_blocks = 2
     for p in base_model.parameters(): p.requires_grad_(False)
