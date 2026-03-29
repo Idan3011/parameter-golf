@@ -87,6 +87,7 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     leaky_relu = bool(int(os.environ.get("LEAKY_RELU", "0")))
+    crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", "0.01"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -412,7 +413,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -439,7 +440,10 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int6(t)
+        if gptq_results is not None and name in gptq_results:
+            q, s = gptq_results[name]
+        else:
+            q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -458,6 +462,48 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
+
+def collect_gptq_hessians(model, val_tokens, seq_len, device, n_batches=256):
+    hessians: dict[str, Tensor] = {}
+    def make_hook(name):
+        def fn(mod, inp, out):
+            x = inp[0].float().reshape(-1, inp[0].size(-1))
+            hessians.setdefault(name, torch.zeros(x.size(1), x.size(1), device=device)).addmm_(x.t(), x)
+        return fn
+    hooks = [m.register_forward_hook(make_hook(n)) for n, m in model.named_modules() if isinstance(m, CastedLinear) and m.weight.ndim == 2]
+    model.eval()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        pos = 0
+        for _ in range(n_batches):
+            if pos + seq_len + 1 > val_tokens.numel(): pos = 0
+            x = val_tokens[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+            model.forward_logits(x)
+            pos += seq_len
+    for h in hooks: h.remove()
+    for n in hessians: hessians[n] /= (n_batches * seq_len)
+    return hessians
+
+def gptq_quantize_tensor(W: Tensor, H: Tensor, clip: int = 31, blocksize: int = 128, percdamp: float = 0.01) -> tuple[Tensor, Tensor]:
+    W = W.float().clone()
+    _, nc = W.shape
+    damp = percdamp * H.diag().mean()
+    Hinv = torch.linalg.inv(H + damp * torch.eye(nc, device=H.device))
+    row_max = W.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+    scale = row_max / clip
+    for ci in range(0, nc, blocksize):
+        ce = min(ci + blocksize, nc)
+        Hinv1 = Hinv[ci:ce, ci:ce]
+        for i in range(ce - ci):
+            col = ci + i
+            w = W[:, col]
+            d = Hinv1[i, i].clamp_min(1e-12)
+            q = (w / scale.squeeze()).round().clamp(-clip, clip) * scale.squeeze()
+            err = (w - q) / d
+            W[:, col] = q
+            if i + 1 < ce - ci:
+                W[:, col + 1:ce] -= err.unsqueeze(1) * Hinv1[i, i + 1:].unsqueeze(0)
+    q_int = (W / scale).round().clamp(-clip, clip).to(torch.int8)
+    return q_int.contiguous(), scale.squeeze().to(torch.float16).contiguous()
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -1253,6 +1299,14 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            if args.crownq_lambda > 0 and scale < 1.0 and micro_step == grad_accum_steps - 1:
+                crownq_pen = torch.zeros((), device=device)
+                for m in base_model.modules():
+                    if isinstance(m, CastedLinear) and m.weight.ndim == 2:
+                        w = m.weight.float()
+                        rm = w.abs().amax(dim=1).clamp_min(1e-12)
+                        crownq_pen += ((w ** 2).mean(dim=1) * (rm / 15.0) ** 2 / 12.0).sum()
+                loss = loss + args.crownq_lambda * crownq_pen
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1325,18 +1379,27 @@ def main() -> None:
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
         del ema_state
+        log0("gptq:collecting hessians")
+        gptq_H = collect_gptq_hessians(base_model, val_tokens, args.train_seq_len, device)
+        log0(f"gptq:hessians collected layers={len(gptq_H)}")
+        gptq_results: dict[str, tuple[Tensor, Tensor]] = {}
+        sd = base_model.state_dict()
+        for gname, H in gptq_H.items():
+            key = gname + ".weight"
+            if key in sd and sd[key].ndim == 2:
+                q, s = gptq_quantize_tensor(sd[key].to(H.device), H)
+                gptq_results[key] = (q.cpu(), s.cpu())
+                sd[key] = (q.float() * s[:, None]).cpu()
+        base_model.load_state_dict(sd, strict=True)
+        log0(f"gptq:quantized {len(gptq_results)} layers")
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
-            model_bytes = os.path.getsize("final_model.pt")
-            code_bytes = len(code.encode("utf-8"))
-            log0(f"Serialized model: {model_bytes} bytes")
-            log0(f"Code size: {code_bytes} bytes")
-            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
+            log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), gptq_results=gptq_results)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
-        quant_blob = lzma.compress(quant_raw, preset=6)
+        quant_blob = lzma.compress(quant_raw, preset=9)
         quant_raw_bytes = len(quant_raw)
         if master_process:
             with open("final_model.int6.ptz", "wb") as f:
