@@ -411,7 +411,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -438,7 +438,10 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int6(t)
+        if gptq_results is not None and name in gptq_results:
+            q, s = gptq_results[name]
+        else:
+            q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -1387,20 +1390,20 @@ def main() -> None:
         log0("gptq:collecting hessians")
         gptq_H = collect_gptq_hessians(base_model, val_tokens, args.train_seq_len, device)
         log0(f"gptq:hessians collected layers={len(gptq_H)}")
+        gptq_results: dict[str, tuple[Tensor, Tensor]] = {}
         sd = base_model.state_dict()
         for gname, H in gptq_H.items():
             key = gname + ".weight"
             if key in sd and sd[key].ndim == 2:
                 q, s = gptq_quantize_tensor(sd[key].to(H.device), H)
+                gptq_results[key] = (q.cpu(), s.cpu())
                 sd[key] = (q.float() * s[:, None]).cpu()
         base_model.load_state_dict(sd, strict=True)
-        log0("gptq:quantization complete")
+        log0(f"gptq:quantized {len(gptq_results)} layers")
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
-            model_bytes = os.path.getsize("final_model.pt")
-            code_bytes = len(code.encode("utf-8"))
-            log0(f"Serialized model: {model_bytes} bytes  Code: {code_bytes} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
+            log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), gptq_results=gptq_results)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
