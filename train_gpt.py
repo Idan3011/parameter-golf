@@ -82,11 +82,12 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     leaky_relu = bool(int(os.environ.get("LEAKY_RELU", "0")))
+    crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", "0.01"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -280,15 +281,6 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
-_NG_B = 1 << 22
-_NG_ORDERS = (11, 10, 9, 8, 7, 6, 5, 4, 3, 2)
-_NG_MIN = 2
-_NG_MULT = 265443576
-_NG_PAIR_MULT = 1000003
-_PH_LENGTHS = (48, 36, 28, 20, 16)
-_PH_B = 1 << 22
-_NG_ENT_CENTERS = {11: 2.5, 10: 2.7, 9: 3.0, 8: 3.0, 7: 3.0, 6: 3.2, 5: 3.5, 4: 3.8, 3: 4.2, 2: 4.5}
-_NG_ORDER_WEIGHTS = {11: 2.0, 10: 2.0, 9: 2.0, 8: 2.0, 7: 2.0, 6: 1.88, 5: 1.88, 4: 1.0, 3: 0.45, 2: 0.30}
 
 def eval_val_sliding(
     args: Hyperparameters,
@@ -302,7 +294,7 @@ def eval_val_sliding(
     is_boundary_token_lut: Tensor,
     stride: int = 64,
     batch_size: int = 256,
-) -> tuple[float, float, float]:
+) -> tuple[float, float]:
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel()
     windows: list[tuple[int, int]] = []
@@ -314,29 +306,12 @@ def eval_val_sliding(
     total_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     total_scored_tokens = torch.zeros((), device=device, dtype=torch.float64)
     total_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    vt_gpu = val_tokens.to(device=device, dtype=torch.int64)
-    ng_hashes = {}
-    for order in _NG_ORDERS:
-        h = torch.zeros(total_tokens, dtype=torch.int64, device=device)
-        for ki in range(order - 1):
-            h[order-1:] = (h[order-1:] * _NG_MULT + vt_gpu[ki:total_tokens - order + 1 + ki]) % _NG_B
-        ng_hashes[order] = h
-    print(f"  ngram hashes precomputed", flush=True)
-    ph_hashes, ph_ctx, ph_full = {}, {}, {}
-    for L in _PH_LENGTHS:
-        h = torch.zeros(total_tokens, dtype=torch.int64, device=device)
-        for k in range(L): h[L:] = (h[L:] * _NG_MULT + vt_gpu[k:total_tokens-L+k]) % _PH_B
-        ph_hashes[L] = h.int()
-        ph_ctx[L] = torch.zeros(_PH_B, dtype=torch.int32, device=device)
-        ph_full[L] = torch.zeros(_PH_B, dtype=torch.int32, device=device)
-    print(f"  phrase hashes precomputed", flush=True)
-    scored_pos_list, scored_tgt_list, scored_mp_list, scored_H_list, scored_pe_list = [], [], [], [], []
     base_model.eval()
     num_batches = (len(my_windows) + batch_size - 1) // batch_size
     with torch.inference_mode():
         for batch_start in range(0, len(my_windows), batch_size):
             if batch_start % (batch_size * 500) == 0:
-                print(f"  phase1 batch {batch_start // batch_size}/{num_batches}", flush=True)
+                print(f"  sliding batch {batch_start // batch_size}/{num_batches}", flush=True)
             batch_windows = my_windows[batch_start:batch_start + batch_size]
             x_list, y_list = [], []
             for win_start, _ in batch_windows:
@@ -345,13 +320,10 @@ def eval_val_sliding(
             x = torch.stack(x_list).to(device=device, dtype=torch.int64)
             y = torch.stack(y_list).to(device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits, pe_delta = base_model.forward_logits(x, return_pe_delta=True)
+                logits = base_model.forward_logits(x)
             per_token_loss = F.cross_entropy(
                 logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none",
             ).reshape(len(batch_windows), seq_len)
-            lp = F.log_softmax(logits.float(), dim=-1)
-            ent = -(lp.exp() * lp).sum(dim=-1)
-            tgt_p = lp.gather(-1, y.unsqueeze(-1)).squeeze(-1).exp()
             for idx, (win_start, score_start) in enumerate(batch_windows):
                 scored_loss = per_token_loss[idx, score_start:]
                 total_loss_sum += scored_loss.to(torch.float64).sum()
@@ -361,102 +333,15 @@ def eval_val_sliding(
                 token_bytes = base_bytes_lut[scored_tgt].to(dtype=torch.int16)
                 token_bytes += (has_leading_space_lut[scored_tgt] & ~is_boundary_token_lut[scored_prev]).to(dtype=torch.int16)
                 total_byte_count += token_bytes.to(torch.float64).sum()
-                pos = torch.arange(score_start, seq_len, dtype=torch.int64, device=device) + win_start + 1
-                scored_pos_list.append(pos); scored_tgt_list.append(vt_gpu[pos])
-                scored_mp_list.append(tgt_p[idx, score_start:]); scored_H_list.append(ent[idx, score_start:])
-                scored_pe_list.append(pe_delta[idx, score_start:])
     distributed = dist.is_available() and dist.is_initialized()
     if distributed:
         dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_scored_tokens, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_byte_count, op=dist.ReduceOp.SUM)
-    all_sp = torch.cat(scored_pos_list); all_st = torch.cat(scored_tgt_list)
-    all_sm = torch.cat(scored_mp_list); all_sH = torch.cat(scored_H_list)
-    all_spe = torch.cat(scored_pe_list)
-    if distributed:
-        gathered = [torch.zeros_like(all_sp) for _ in range(world_size)]
-        for tensor, name in [(all_sp, 'pos'), (all_st, 'tgt'), (all_sm, 'mp'), (all_sH, 'H'), (all_spe, 'pe')]:
-            sizes = [torch.tensor(tensor.shape[0], device=device) for _ in range(world_size)]
-            dist.all_gather(sizes, torch.tensor(tensor.shape[0], device=device))
-            max_size = max(s.item() for s in sizes)
-            padded = torch.zeros(max_size, dtype=tensor.dtype, device=device)
-            padded[:tensor.shape[0]] = tensor
-            gathered_list = [torch.zeros_like(padded) for _ in range(world_size)]
-            dist.all_gather(gathered_list, padded)
-            if name == 'pos': all_sp = torch.cat([g[:sizes[i].item()] for i, g in enumerate(gathered_list)])
-            elif name == 'tgt': all_st = torch.cat([g[:sizes[i].item()] for i, g in enumerate(gathered_list)])
-            elif name == 'mp': all_sm = torch.cat([g[:sizes[i].item()] for i, g in enumerate(gathered_list)])
-            elif name == 'H': all_sH = torch.cat([g[:sizes[i].item()] for i, g in enumerate(gathered_list)])
-            elif name == 'pe': all_spe = torch.cat([g[:sizes[i].item()] for i, g in enumerate(gathered_list)])
-    sort_idx = all_sp.argsort()
-    all_sp = all_sp[sort_idx]; all_st = all_st[sort_idx]; all_sm = all_sm[sort_idx]
-    all_sH = all_sH[sort_idx]; all_spe = all_spe[sort_idx]
-    print(f"  phase2: {all_sp.shape[0]} scored tokens, rank {rank}", flush=True)
-    ng_ctx, ng_pair = {}, {}
-    for order in _NG_ORDERS:
-        ng_ctx[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
-        ng_pair[order] = torch.zeros(_NG_B, dtype=torch.int32, device=device)
-    ng_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    chunk_size = 16384
-    EPS = 1e-8
-    for ci in range(0, all_sp.shape[0], chunk_size):
-        ce = min(ci + chunk_size, all_sp.shape[0])
-        ap = all_sp[ci:ce]; at = all_st[ci:ce]; amp = all_sm[ci:ce]
-        aH = all_sH[ci:ce]; aPE = all_spe[ci:ce]
-        n = ap.shape[0]
-        best_ng = torch.zeros(n, device=device); found = torch.zeros(n, dtype=torch.bool, device=device)
-        alpha = torch.zeros(n, device=device)
-        for order in _NG_ORDERS:
-            m = (ap >= order) & (~found)
-            if not m.any(): continue
-            ch = ng_hashes[order][ap[m]]
-            cc = ng_ctx[order][ch]; has = cc >= _NG_MIN
-            if not has.any(): continue
-            ph = (ch * _NG_PAIR_MULT + at[m]) % _NG_B
-            ng_p = (ng_pair[order][ph].float() / cc.float().clamp(min=1)).clamp(EPS, 1 - EPS) * _NG_ORDER_WEIGHTS[order]
-            ng_p = ng_p.clamp(0, 1)
-            ix = m.nonzero(as_tuple=True)[0]; best_ng[ix[has]] = ng_p[has]; found[ix[has]] = True
-            ec = _NG_ENT_CENTERS[order]
-            a = 0.20 + 0.55 / (1.0 + torch.exp(-2.0 * (aH[m][has] - ec)))
-            alpha[ix[has]] = a
-        pe_conf = aPE / aPE.max().clamp(min=1e-8)
-        alpha = alpha * (0.5 + 1.0 * pe_conf)
-        mixed = torch.where(found, (1 - alpha) * amp + alpha * best_ng, amp)
-        pp_found = torch.zeros(n, dtype=torch.bool, device=device); pp_val = torch.zeros(n, device=device); pp_len = torch.zeros(n, device=device)
-        for L in _PH_LENGTHS:
-            vm = (ap >= L) & (~pp_found)
-            if not vm.any(): continue
-            ch = ph_hashes[L][ap[vm]].long(); cc = ph_ctx[L][ch]; has = cc >= 1
-            if not has.any(): continue
-            th = (ch * _NG_MULT + at[vm].long()) % _PH_B
-            pp = (ph_full[L][th].float() / cc.float().clamp(min=1)).clamp(0, 1)
-            ix = vm.nonzero(as_tuple=True)[0]; pp_val[ix[has]] = pp[has]; pp_found[ix[has]] = True; pp_len[ix[has]] = float(L)
-        lf = (0.90 + 0.09 * (pp_len - 16) / 32).clamp(0.9, 0.99)
-        ef = torch.sigmoid(2.0 * (aH - 2.5))
-        a_ph = lf * (0.5 + 0.5 * ef)
-        final = torch.where(pp_found, (1 - a_ph) * mixed + a_ph * pp_val, mixed)
-        ng_loss_sum -= torch.log(final.clamp(min=1e-20)).to(torch.float64).sum()
-        for order in _NG_ORDERS:
-            v = ap >= order
-            if not v.any(): continue
-            ch = ng_hashes[order][ap[v]]
-            ng_ctx[order].scatter_add_(0, ch, torch.ones_like(ch, dtype=torch.int32))
-            pph = (ch * _NG_PAIR_MULT + at[v]) % _NG_B
-            ng_pair[order].scatter_add_(0, pph, torch.ones_like(pph, dtype=torch.int32))
-        for L in _PH_LENGTHS:
-            v = ap >= L
-            if not v.any(): continue
-            ch = ph_hashes[L][ap[v]].long()
-            ph_ctx[L].scatter_add_(0, ch, torch.ones_like(ch, dtype=torch.int32))
-            th = (ch * _NG_MULT + at[v].long()) % _PH_B
-            ph_full[L].scatter_add_(0, th, torch.ones_like(th, dtype=torch.int32))
-    if distributed:
-        dist.broadcast(ng_loss_sum, src=0)
     val_loss = (total_loss_sum / total_scored_tokens).item()
     bpb = (total_loss_sum / (total_byte_count * math.log(2.0))).item()
-    ng_bpb = (ng_loss_sum / (total_byte_count * math.log(2.0))).item()
     base_model.train()
-    return float(val_loss), float(bpb), float(ng_bpb)
+    return float(val_loss), float(bpb)
 
 
 
@@ -575,6 +460,71 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
+def collect_gptq_hessians(model, val_tokens, seq_len, device, n_batches=256):
+    hessians: dict[str, Tensor] = {}
+    def make_hook(name):
+        def fn(mod, inp, out):
+            x = inp[0].float().reshape(-1, inp[0].size(-1))
+            hessians.setdefault(name, torch.zeros(x.size(1), x.size(1), device=device)).addmm_(x.t(), x)
+        return fn
+    hooks = [m.register_forward_hook(make_hook(n)) for n, m in model.named_modules() if isinstance(m, CastedLinear) and m.weight.ndim == 2]
+    model.eval()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        pos = 0
+        for _ in range(n_batches):
+            if pos + seq_len + 1 > val_tokens.numel(): pos = 0
+            x = val_tokens[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+            model.forward_logits(x)
+            pos += seq_len
+    for h in hooks: h.remove()
+    for n in hessians: hessians[n] /= (n_batches * seq_len)
+    return hessians
+
+def gptq_quantize_tensor(W: Tensor, H: Tensor, clip: int = 31, blocksize: int = 128, percdamp: float = 0.01) -> tuple[Tensor, Tensor]:
+    W = W.float().clone()
+    nr, nc = W.shape
+    damp = percdamp * H.diag().mean()
+    Hinv = torch.linalg.inv(H + damp * torch.eye(nc, device=H.device))
+    row_max = W.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+    scale = row_max / clip
+    for ci in range(0, nc, blocksize):
+        ce = min(ci + blocksize, nc)
+        Hinv1 = Hinv[ci:ce, ci:ce]
+        for i in range(ce - ci):
+            col = ci + i
+            w = W[:, col]
+            d = Hinv1[i, i].clamp_min(1e-12)
+            q = (w / scale.squeeze()).round().clamp(-clip, clip) * scale.squeeze()
+            err = (w - q) / d
+            W[:, col] = q
+            if i + 1 < ce - ci:
+                W[:, col + 1:ce] -= err.unsqueeze(1) * Hinv1[i, i + 1:].unsqueeze(0)
+    q_int = (W / scale).round().clamp(-clip, clip).to(torch.int8)
+    return q_int.contiguous(), scale.squeeze().to(torch.float16).contiguous()
+
+def ttt_burst(base_model, val_tokens, seq_len, device, vocab_size, log_fn, epochs=2, chunk_seqs=100, lr=0.0001):
+    buf = val_tokens[:chunk_seqs * seq_len + 1].to(device, dtype=torch.int64)
+    base_model.eval()
+    with torch.inference_mode():
+        for i in range(chunk_seqs):
+            base_model.forward_logits(buf[i * seq_len:(i + 1) * seq_len].unsqueeze(0))
+    log_fn(f"ttt_burst:scored {chunk_seqs} sequences")
+    opt = torch.optim.AdamW(base_model.parameters(), lr=lr, weight_decay=0.01)
+    base_model.train()
+    for ep in range(epochs):
+        tl = 0.0
+        for i in range(chunk_seqs):
+            s = i * seq_len
+            x, y = buf[s:s + seq_len].unsqueeze(0), buf[s + 1:s + seq_len + 1].unsqueeze(0)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = F.cross_entropy(base_model.forward_logits(x).float().view(-1, vocab_size), y.view(-1))
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+            tl += loss.item()
+        log_fn(f"ttt_burst:epoch:{ep + 1}/{epochs} avg_loss:{tl / chunk_seqs:.4f}")
+    base_model.eval()
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -656,8 +606,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
-
-
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -677,7 +625,6 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
-
 
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
@@ -708,7 +655,6 @@ class TokenStream:
             self.pos += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
@@ -919,8 +865,6 @@ class Block(nn.Module):
         x = x + s * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x, v
 
-
-
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -930,7 +874,6 @@ class SmearGate(nn.Module):
         g = torch.sigmoid(self.gate).to(dtype=x.dtype)
         x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
         return g * x + (1.0 - g) * x_prev
-
 
 class BigramHash(nn.Module):
     def __init__(self, num_buckets: int, hash_dim: int, model_dim: int):
@@ -944,7 +887,6 @@ class BigramHash(nn.Module):
         prev_ids = torch.cat([torch.zeros_like(input_ids[:, :1]), input_ids[:, :-1]], dim=1)
         h = ((prev_ids.long() * 92821 + input_ids.long()) % self.num_buckets).long()
         return self.proj(self.table(h))
-
 
 class GPT(nn.Module):
     def __init__(
@@ -1363,6 +1305,14 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            if args.crownq_lambda > 0 and scale < 1.0 and micro_step == grad_accum_steps - 1:
+                crownq_pen = torch.zeros((), device=device)
+                for m in base_model.modules():
+                    if isinstance(m, CastedLinear) and m.weight.ndim == 2:
+                        w = m.weight.float()
+                        rm = w.abs().amax(dim=1).clamp_min(1e-12)
+                        crownq_pen += ((w ** 2).mean(dim=1) * (rm / 15.0) ** 2 / 12.0).sum()
+                loss = loss + args.crownq_lambda * crownq_pen
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1435,18 +1385,28 @@ def main() -> None:
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
         del ema_state
+        ttt_burst(base_model, val_tokens, args.train_seq_len, device, args.vocab_size, log0)
+        log0("gptq:collecting hessians")
+        gptq_H = collect_gptq_hessians(base_model, val_tokens, args.train_seq_len, device)
+        log0(f"gptq:hessians collected layers={len(gptq_H)}")
+        sd = base_model.state_dict()
+        for gname, H in gptq_H.items():
+            key = gname + ".weight"
+            if key in sd and sd[key].ndim == 2:
+                q, s = gptq_quantize_tensor(sd[key].to(H.device), H)
+                sd[key] = (q.float() * s[:, None]).cpu()
+        base_model.load_state_dict(sd, strict=True)
+        log0("gptq:quantization complete")
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
             model_bytes = os.path.getsize("final_model.pt")
             code_bytes = len(code.encode("utf-8"))
-            log0(f"Serialized model: {model_bytes} bytes")
-            log0(f"Code size: {code_bytes} bytes")
-            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+            log0(f"Serialized model: {model_bytes} bytes  Code: {code_bytes} bytes")
         quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
-        quant_blob = lzma.compress(quant_raw, preset=6)
+        quant_blob = lzma.compress(quant_raw, preset=9)
         quant_raw_bytes = len(quant_raw)
         if master_process:
             with open("final_model.int6.ptz", "wb") as f:
@@ -1481,16 +1441,16 @@ def main() -> None:
 
     torch.cuda.synchronize()
     t_slide = time.perf_counter()
-    sw_val_loss, sw_val_bpb, ng_bpb = eval_val_sliding(
+    sw_val_loss, sw_val_bpb = eval_val_sliding(
         args, base_model, rank, world_size, device,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(
-        f"final_sliding_window sliding_bpb:{sw_val_bpb:.4f} val_bpb:{ng_bpb:.4f} "
+        f"final_sliding_window val_bpb:{sw_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
     )
-    log0(f"final_sliding_window_exact sliding_bpb:{sw_val_bpb:.8f} val_bpb:{ng_bpb:.8f}")
+    log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
