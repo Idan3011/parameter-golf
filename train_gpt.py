@@ -1174,6 +1174,8 @@ def main() -> None:
     ema_decay = float(os.environ.get("EMA_DECAY", "0.997"))
     use_ema = bool(int(os.environ.get("USE_EMA", "0")))
     ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()} if use_ema else None
+    swa_snapshots: list[dict[str, Tensor]] = []
+    swa_every = 50
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1265,6 +1267,8 @@ def main() -> None:
             with torch.no_grad():
                 for n, p in base_model.named_parameters():
                     ema_state[n].mul_(ema_decay).add_(p.data.float(), alpha=1.0 - ema_decay)
+        if scale < 0.2 and step % swa_every == 0:
+            swa_snapshots.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1296,7 +1300,23 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    if ema_state is not None:
+    if swa_snapshots and ema_state is not None:
+        log0(f"swa: averaging {len(swa_snapshots)} checkpoints on top of EMA")
+        ema_cpu = {k: v.cpu() for k, v in ema_state.items()}
+        avg = {k: torch.zeros_like(v, dtype=torch.float32) for k, v in ema_cpu.items()}
+        for snap in swa_snapshots:
+            for k in avg:
+                avg[k] += snap[k].float()
+        for k in avg:
+            avg[k] /= len(swa_snapshots)
+            avg[k] = 0.5 * ema_cpu[k].float() + 0.5 * avg[k]
+        base_model.load_state_dict(avg, strict=True)
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+        restore_low_dim_params_to_fp32(base_model)
+        del ema_state, swa_snapshots, avg
+    elif ema_state is not None:
         log0("ema: loading weights")
         ema_state = {k: v.cpu() for k, v in ema_state.items()}
         base_model.load_state_dict(ema_state, strict=True)
