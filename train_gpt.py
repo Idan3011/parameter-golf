@@ -336,25 +336,18 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bpb)
 
-def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1, batch_size=32):
+def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1):
     seqs = list(range(0, chunk.numel() - seq_len - 1, seq_len))
-    distributed = dist.is_available() and dist.is_initialized()
     for _ in range(n_epochs):
-        my_seqs = seqs[rank::world_size]
-        for bi in range(0, len(my_seqs), batch_size):
-            batch_pos = my_seqs[bi:bi + batch_size]
-            x = torch.stack([chunk[p:p + seq_len] for p in batch_pos]).to(device=device, dtype=torch.int64)
-            y = torch.stack([chunk[p + 1:p + seq_len + 1] for p in batch_pos]).to(device=device, dtype=torch.int64)
+        for pos in seqs:
+            x = chunk[pos:pos + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+            y = chunk[pos + 1:pos + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model.forward_logits(x)
-                loss = F.cross_entropy(logits.float().reshape(-1, vocab_size), y.reshape(-1))
-            (loss / max(len(my_seqs) // batch_size, 1)).backward()
-        if distributed:
-            for p in model.parameters():
-                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-        opt.step()
-        opt.zero_grad()
+                loss = F.cross_entropy(model.forward_logits(x).float().reshape(-1, vocab_size), y.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+            opt.step()
+            opt.zero_grad()
 
 def eval_val_ttt(
     args, base_model, rank, world_size, device, val_tokens,
@@ -368,28 +361,28 @@ def eval_val_ttt(
     pe_only = ttt_mode in (2, 3)
     use_ema = ttt_mode in (3, 4)
     combo = ttt_mode == 5
-    epochs_full = int(os.environ.get("TTT_EPOCHS", "1"))
-    epochs_pe = int(os.environ.get("TTT_EPOCHS_PE", "3"))
-    lr_full = float(os.environ.get("TTT_LR", "0.00001"))
-    lr_pe = float(os.environ.get("TTT_LR_PE", "0.0001"))
+    epochs_full = int(os.environ.get("TTT_EPOCHS", "3"))
+    epochs_pe = int(os.environ.get("TTT_EPOCHS_PE", "10"))
+    lr_full = float(os.environ.get("TTT_LR", "0.002"))
+    lr_pe = float(os.environ.get("TTT_LR_PE", "0.0003"))
     ema_decay = 0.998
-    freeze_blocks = 2
+    freeze_blocks = int(os.environ.get("TTT_FREEZE", "0"))
     for p in base_model.parameters(): p.requires_grad_(False)
     if pe_only:
         for p in base_model.pre_enrich.parameters(): p.requires_grad_(True)
-        ttt_opt = torch.optim.AdamW(base_model.pre_enrich.parameters(), lr=lr_pe, weight_decay=0.01)
+        ttt_opt = torch.optim.SGD(base_model.pre_enrich.parameters(), lr=lr_pe, momentum=0.9)
     else:
         for p in base_model.parameters(): p.requires_grad_(True)
         for i in range(freeze_blocks):
             for p in base_model.blocks[i].parameters(): p.requires_grad_(False)
-        ttt_opt = torch.optim.AdamW([p for p in base_model.parameters() if p.requires_grad], lr=lr_full, weight_decay=0.01)
+        ttt_opt = torch.optim.SGD([p for p in base_model.parameters() if p.requires_grad], lr=lr_full, momentum=0.9)
     if combo:
         for p in base_model.parameters(): p.requires_grad_(True)
         for i in range(freeze_blocks):
             for p in base_model.blocks[i].parameters(): p.requires_grad_(False)
-        ttt_opt_pe = torch.optim.AdamW(base_model.pre_enrich.parameters(), lr=lr_pe, weight_decay=0.01)
+        ttt_opt_pe = torch.optim.SGD(base_model.pre_enrich.parameters(), lr=lr_pe, momentum=0.9)
         pe_ids = {id(p) for p in base_model.pre_enrich.parameters()}
-        ttt_opt_full = torch.optim.AdamW([p for p in base_model.parameters() if p.requires_grad and id(p) not in pe_ids], lr=lr_full, weight_decay=0.01)
+        ttt_opt_full = torch.optim.SGD([p for p in base_model.parameters() if p.requires_grad and id(p) not in pe_ids], lr=lr_full, momentum=0.9)
     ema_state = {n: p.data.clone() for n, p in base_model.named_parameters() if p.requires_grad} if use_ema or combo else None
     chunk_starts = list(range(0, val_tokens.numel() - seq_len - 1, chunk_tokens))
     for ci, cs in enumerate(chunk_starts):
@@ -1445,20 +1438,17 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    torch.cuda.synchronize()
-    t_slide = time.perf_counter()
-    sw_val_loss, sw_val_bpb = eval_val_sliding(
-        args, base_model, rank, world_size, device,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_sliding_window val_bpb:{sw_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
-    )
-    log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
-
     ttt_mode = int(os.environ.get("TTT_MODE", "0"))
+    if ttt_mode == 0:
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(f"final_sliding_window val_bpb:{sw_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
+        log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
     if ttt_mode > 0:
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
         torch.cuda.synchronize()
