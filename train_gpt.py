@@ -392,18 +392,6 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 
 _QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
 
-def pack_int6(q: Tensor) -> bytes:
-    d = (q.flatten().to(torch.int8) + _QUANT_CLIP).numpy().astype(np.uint8)
-    pad = (4 - len(d) % 4) % 4
-    if pad: d = np.pad(d, (0, pad))
-    a, b, c, e = d[0::4], d[1::4], d[2::4], d[3::4]
-    return np.stack([(a << 2) | (b >> 4), ((b & 0xF) << 4) | (c >> 2), ((c & 0x3) << 6) | e], axis=1).tobytes()
-
-def unpack_int6(data: bytes, n: int) -> Tensor:
-    raw = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3)
-    a, b, c = raw[:, 0], raw[:, 1], raw[:, 2]
-    vals = np.stack([a >> 2, ((a & 3) << 4) | (b >> 4), ((b & 0xF) << 2) | (c >> 6), c & 0x3F], axis=1).flatten()[:n]
-    return torch.tensor(vals, dtype=torch.int8) - _QUANT_CLIP
 
 def gptq_collect_hessians(model, val_tokens, seq_len, device, n_batches=256):
     hessians: dict[str, Tensor] = {}
@@ -484,7 +472,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
         best_q, best_s, best_mse = None, None, float("inf")
         for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
             ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / float(clip)).clamp_min(1e-12)
+            s = (ca / float(clip)).clamp_min(1.0 / clip)
             q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -clip, clip)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
             if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
@@ -527,15 +515,12 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], gptq_results: dict[s
             q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
-        packed = pack_int6(q)
-        quantized[name] = packed
-        qmeta.setdefault(name, {})["shape"] = list(q.shape)
-        qmeta[name]["numel"] = int(q.numel())
+        quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += len(packed) + tensor_nbytes(s)
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
     obj: dict[str, object] = {
-        "__quant_format__": "int6_packed_v1",
+        "__quant_format__": "int6_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -582,17 +567,11 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
-    packed = obj.get("__quant_format__", "").startswith("int6_packed")
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q_data in obj["quantized"].items():
+    for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        meta = qmeta.get(name, {})
-        if packed and isinstance(q_data, bytes):
-            q = unpack_int6(q_data, meta["numel"]).reshape(meta["shape"])
-        else:
-            q = q_data
-        if meta.get("scheme") == "per_row" or s.ndim > 0:
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
