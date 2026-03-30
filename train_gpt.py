@@ -400,7 +400,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
         best_q, best_s, best_mse = None, None, float("inf")
         for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
             ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / 31.0).clamp_min(1.0 / 31.0)
+            s = (ca / 31.0).clamp_min(1.0 / 127.0)
             q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -31, 31)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
             if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
@@ -1216,6 +1216,7 @@ def main() -> None:
         ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
         swa_state: dict[str, Tensor] | None = None
         swa_count = 0
+        growth_snapshot: dict[str, Tensor] | None = None
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
@@ -1320,11 +1321,18 @@ def main() -> None:
                                 break
                 base_model.grow_to(prog_target)
                 optimizer_muon.state.clear()
+                if prog_target == args.num_layers:
+                    ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
+                    growth_snapshot = {k: v.detach().cpu().clone().float() for k, v in base_model.state_dict().items()}
+                    swa_state = None
+                    swa_count = 0
+                    log0(f"progressive: RESET EMA/SWA + saved snapshot at step {step}")
                 log0(f"progressive: grew to {prog_target}L at step {step}, blocks {newly_activated}")
+        _ema_d = 0.95 if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) else args.ema_decay
         with torch.no_grad():
             for k, v in base_model.state_dict().items():
-                ema_state[k].mul_(args.ema_decay).add_(v.detach().float(), alpha=1.0 - args.ema_decay)
-            if scale < 0.5 and step % 25 == 0:
+                ema_state[k].mul_(_ema_d).add_(v.detach().float(), alpha=1.0 - _ema_d)
+            if scale < 0.5 and step % 5 == 0:
                 sd = {k: v.detach().cpu().float() for k, v in base_model.state_dict().items()}
                 if swa_state is None: swa_state, swa_count = sd, 1
                 else:
@@ -1362,6 +1370,12 @@ def main() -> None:
                 swa_state[k] /= swa_count
                 ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
             del swa_state
+        if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) and growth_snapshot is not None:
+            alpha = 0.2
+            for k in ema_state:
+                if k in growth_snapshot: ema_state[k] = alpha * growth_snapshot[k] + (1.0 - alpha) * ema_state[k]
+            log0(f"progressive: blended growth snapshot (alpha={alpha})")
+            del growth_snapshot
         log0("ema: loading weights")
         base_model.load_state_dict(ema_state, strict=True)
         for module in base_model.modules():
@@ -1380,7 +1394,7 @@ def main() -> None:
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
-        quant_blob = lzma.compress(quant_raw, preset=6)
+        quant_blob = lzma.compress(quant_raw, preset=9)
         quant_raw_bytes = len(quant_raw)
         if master_process:
             with open("final_model.int6.ptz", "wb") as f:
