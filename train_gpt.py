@@ -1072,7 +1072,7 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.use_qat = True
-    compiled_model = base_model if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) else torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=True) if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) else torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
