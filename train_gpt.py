@@ -717,20 +717,13 @@ class _FakeQuantInt6(torch.autograd.Function):
 def fake_quant_int6(w: Tensor) -> Tensor:
     return _FakeQuantInt6.apply(w)
 
-_USE_BITNET = bool(int(os.environ.get("USE_BITNET", "0")))
-
 class CastedLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_qat = False
-        self.use_bitnet = False
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self.use_bitnet:
-            gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
-            w_t = torch.clamp(torch.round(w / gamma), -1, 1)
-            w = (w_t * gamma - w).detach() + w
         if self.use_qat and self.training:
             w = fake_quant_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
@@ -1150,7 +1143,7 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.use_qat = True
-    if _USE_BITNET:
+    if bool(int(os.environ.get("USE_BITNET", "0"))):
         for block in base_model.blocks:
             for m in block.modules():
                 if isinstance(m, CastedLinear): m.use_bitnet = True
