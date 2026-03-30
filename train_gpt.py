@@ -503,16 +503,15 @@ def quantize_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(w / gamma[:, None]), -1, 1).to(torch.int8).contiguous()
     return q, gamma.to(torch.float16).contiguous()
 
-_QUANT_CLAMP_MIN = 1e-8 if bool(int(os.environ.get("USE_BITNET", "0"))) else 1.0 / int(os.environ.get("QUANT_CLIP", "31"))
-
-def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_int6(t: Tensor, clamp_min: float = 0.0) -> tuple[Tensor, Tensor]:
     clip = _QUANT_CLIP
+    cmin = clamp_min if clamp_min > 0 else 1.0 / clip
     t32 = t.float()
     if t32.ndim == 2:
         best_q, best_s, best_mse = None, None, float("inf")
         for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
             ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / float(clip)).clamp_min(_QUANT_CLAMP_MIN)
+            s = (ca / float(clip)).clamp_min(cmin)
             q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -clip, clip)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
             if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
@@ -522,7 +521,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -clip, clip).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor], ternary_names: set[str] | None = None):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor], bitnet_names: set[str] | None = None):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -549,10 +548,8 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], ternary_names: set[s
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        if ternary_names and name in ternary_names and t.ndim == 2:
-            q, s = quantize_ternary(t)
-        else:
-            q, s = quantize_float_tensor_int6(t)
+        cmin = 1e-8 if bitnet_names and name in bitnet_names else 0.0
+        q, s = quantize_float_tensor_int6(t, clamp_min=cmin)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -735,7 +732,7 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self.use_bitnet:
-            gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+            gamma = (1.0 / _QUANT_CLIP) * torch.ones(w.shape[0], 1, device=w.device, dtype=w.dtype)
             w_t = torch.clamp(torch.round(w / gamma), -1, 1)
             w = (w_t * gamma - w).detach() + w
         elif self.use_qat and self.training:
