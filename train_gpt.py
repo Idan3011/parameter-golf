@@ -1452,11 +1452,14 @@ def main() -> None:
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    torch._dynamo.reset()
+    eval_model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device)
+    eval_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    eval_model.eval()
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args, model, rank, world_size, device, grad_accum_steps,
+        args, eval_model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
@@ -1470,7 +1473,7 @@ def main() -> None:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
         sw_val_loss, sw_val_bpb = eval_val_sliding(
-            args, base_model, rank, world_size, device,
+            args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
         torch.cuda.synchronize()
@@ -1492,8 +1495,5 @@ def main() -> None:
         log0(f"final_ttt_mode{ttt_mode} val_bpb:{ttt_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
         log0(f"final_ttt_mode{ttt_mode}_exact val_bpb:{ttt_bpb:.8f}")
 
-    if distributed:
-        dist.destroy_process_group()
-
-if __name__ == "__main__":
-    main()
+    if distributed: dist.destroy_process_group()
+if __name__ == "__main__": main()
