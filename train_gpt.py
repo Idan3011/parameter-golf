@@ -1230,11 +1230,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-
-    # -----------------------------
     # DATA LOADER & MODEL WARMUP
-    # -----------------------------
-
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
@@ -1285,10 +1281,7 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # -----------------------------
     # MAIN TRAINING LOOP
-    # -----------------------------
-
     training_time_ms = 0.0
     if not eval_only:
         stop_after_step: int | None = None
@@ -1403,15 +1396,18 @@ def main() -> None:
 
     if not eval_only:
         log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
-        ema_state = {k: v.cpu() for k, v in ema_state.items()}
-        if swa_state is not None and swa_count > 0:
-            log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
-            for k in swa_state:
-                swa_state[k] /= swa_count
-                ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
-            del swa_state
-        log0("ema: loading weights")
-        base_model.load_state_dict(ema_state, strict=True)
+        if not bool(int(os.environ.get("USE_BITNET", "0"))):
+            ema_state = {k: v.cpu() for k, v in ema_state.items()}
+            if swa_state is not None and swa_count > 0:
+                log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
+                for k in swa_state:
+                    swa_state[k] /= swa_count
+                    ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
+                del swa_state
+            log0("ema: loading weights")
+            base_model.load_state_dict(ema_state, strict=True)
+        else:
+            log0("bitnet: skipping EMA/SWA — using raw training weights")
         for module in base_model.modules():
             if isinstance(module, CastedLinear):
                 module.float()
@@ -1457,6 +1453,10 @@ def main() -> None:
     quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
     eval_model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device)
     eval_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if bool(int(os.environ.get("USE_BITNET", "0"))):
+        for block in eval_model.blocks:
+            for m in block.modules():
+                if isinstance(m, CastedLinear): m.use_bitnet = True
     eval_model.eval()
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
