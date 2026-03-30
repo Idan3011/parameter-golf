@@ -24,9 +24,9 @@ except:
 
 try:
     from torchao.float8 import convert_to_float8_training
-    model = torch.nn.Sequential(torch.nn.Linear(512, 1536), torch.nn.Linear(1536, 512)).cuda()
+    model = torch.nn.Sequential(torch.nn.Linear(512, 1536), torch.nn.Linear(1536, 512)).cuda().bfloat16()
     convert_to_float8_training(model)
-    x = torch.randn(4, 512, device='cuda', dtype=torch.bfloat16)
+    x = torch.randn(32, 2048, 512, device='cuda', dtype=torch.bfloat16)
     y = model(x)
     loss = y.sum()
     loss.backward()
@@ -39,12 +39,40 @@ try:
     model2 = torch.nn.Sequential(torch.nn.Linear(512, 1536), torch.nn.Linear(1536, 512)).cuda().bfloat16()
     convert_to_float8_training(model2)
     compiled = torch.compile(model2)
-    x = torch.randn(4, 512, device='cuda', dtype=torch.bfloat16)
+    x = torch.randn(32, 2048, 512, device='cuda', dtype=torch.bfloat16)
     y = compiled(x)
     loss = y.sum()
     loss.backward()
     print(f'compile + FP8: WORKS')
 except Exception as e:
     print(f'compile + FP8: FAILED ({e})')
+
+try:
+    import time
+    model3 = torch.nn.Sequential(torch.nn.Linear(512, 1536), torch.nn.Linear(1536, 512)).cuda().bfloat16()
+    model3c = torch.compile(model3)
+    x = torch.randn(32, 2048, 512, device='cuda', dtype=torch.bfloat16)
+    for _ in range(3):
+        model3c(x).sum().backward()
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(20):
+        model3c(x).sum().backward()
+    torch.cuda.synchronize()
+    bf16_ms = (time.time() - t0) / 20 * 1000
+    model4 = torch.nn.Sequential(torch.nn.Linear(512, 1536), torch.nn.Linear(1536, 512)).cuda().bfloat16()
+    convert_to_float8_training(model4)
+    model4c = torch.compile(model4)
+    for _ in range(3):
+        model4c(x).sum().backward()
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(20):
+        model4c(x).sum().backward()
+    torch.cuda.synchronize()
+    fp8_ms = (time.time() - t0) / 20 * 1000
+    print(f'SPEED: bf16={bf16_ms:.1f}ms fp8={fp8_ms:.1f}ms speedup={bf16_ms/fp8_ms:.2f}x')
+except Exception as e:
+    print(f'SPEED TEST FAILED: {e}')
 
 print('\nAll tests done.')
