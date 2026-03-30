@@ -733,7 +733,7 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self.use_bitnet:
-            gamma = torch.quantile(w.abs().float(), 0.75, dim=-1, keepdim=True).clamp(min=1e-5).to(w.dtype)
+            gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
             w_t = torch.clamp(torch.round(w / gamma), -1, 1)
             w = (w_t * gamma - w).detach() + w
         elif self.use_qat and self.training:
@@ -1421,15 +1421,11 @@ def main() -> None:
             if isinstance(module, CastedLinear):
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
-        ternary_names: set[str] | None = None
-        if bool(int(os.environ.get("USE_BITNET", "0"))):
-            ternary_names = {n for n in base_model.state_dict() if 'blocks.' in n and base_model.state_dict()[n].ndim == 2 and base_model.state_dict()[n].is_floating_point()}
-            log0(f"bitnet: {len(ternary_names)} layers will use ternary quantization")
         del ema_state
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
             log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), ternary_names=ternary_names)
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
