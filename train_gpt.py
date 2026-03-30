@@ -863,6 +863,8 @@ class GPT(nn.Module):
         self.num_encoder_layers = (num_layers + 1) // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self._active_enc = self.num_encoder_layers
+        self._active_dec = self.num_decoder_layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
         mlp_mult_enc = int(os.environ.get("MLP_MULT_ENCODER", mlp_mult))
@@ -893,17 +895,24 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def grow_to(self, total_layers: int) -> None:
+        self._active_enc = total_layers // 2
+        self._active_dec = total_layers - self._active_enc
+
     def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
         v0 = None
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
+        enc_outputs: dict[int, Tensor] = {}
+        for i in range(self._active_enc):
             x, v = self.blocks[i](x, x0, v0)
             if v0 is None: v0 = v
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x, v = self.blocks[self.num_encoder_layers + i](x, x0, v0)
+            enc_outputs[i] = x
+        for i in range(self._active_dec):
+            dec_idx = self.num_encoder_layers + (self.num_decoder_layers - self._active_dec) + i
+            dec_step = dec_idx - self.num_encoder_layers
+            matching_enc = self.num_encoder_layers - 1 - dec_step
+            if matching_enc >= 0 and matching_enc < self._active_enc and dec_step < self.num_skip_weights:
+                x = x + self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * enc_outputs[matching_enc]
+            x, v = self.blocks[dec_idx](x, x0, v0)
         return x
 
     def _compute_logits(self, x: Tensor) -> Tensor:
@@ -1061,7 +1070,7 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.use_qat = True
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = base_model if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) else torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1271,6 +1280,39 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) and max_wallclock_ms:
+            elapsed_frac = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max_wallclock_ms
+            if elapsed_frac < 0.25: prog_target = 4
+            elif elapsed_frac < 0.45: prog_target = 7
+            else: prog_target = args.num_layers
+            prog_current = base_model._active_enc + base_model._active_dec
+            if prog_target > prog_current:
+                new_enc = prog_target // 2
+                new_dec = prog_target - new_enc
+                newly_activated = []
+                with torch.no_grad():
+                    for i in range(base_model._active_enc, new_enc):
+                        for p in base_model.blocks[i].parameters():
+                            if p.ndim == 2: nn.init.xavier_normal_(p)
+                        base_model.blocks[i].mlp.proj.weight.data.zero_()
+                        base_model.blocks[i].attn.proj.weight.data.zero_()
+                        newly_activated.append(i)
+                    old_dec_start = base_model.num_encoder_layers + (base_model.num_decoder_layers - base_model._active_dec)
+                    new_dec_start = base_model.num_encoder_layers + (base_model.num_decoder_layers - new_dec)
+                    for dec_idx in range(new_dec_start, old_dec_start):
+                        for p in base_model.blocks[dec_idx].parameters():
+                            if p.ndim == 2: nn.init.xavier_normal_(p)
+                        base_model.blocks[dec_idx].mlp.proj.weight.data.zero_()
+                        base_model.blocks[dec_idx].attn.proj.weight.data.zero_()
+                        newly_activated.append(dec_idx)
+                    for k, v in base_model.state_dict().items():
+                        for bidx in newly_activated:
+                            if f"blocks.{bidx}." in k:
+                                ema_state[k].copy_(v.detach().float())
+                                break
+                base_model.grow_to(prog_target)
+                optimizer_muon.state.clear()
+                log0(f"progressive: grew to {prog_target}L at step {step}, blocks {newly_activated}")
         with torch.no_grad():
             for k, v in base_model.state_dict().items():
                 ema_state[k].mul_(args.ema_decay).add_(v.detach().float(), alpha=1.0 - args.ema_decay)
