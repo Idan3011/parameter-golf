@@ -729,7 +729,7 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self.use_bitnet:
-            gamma = w.detach().abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+            gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
             w_t = torch.clamp(torch.round(w / gamma), -1, 1)
             w = (w_t * gamma - w).detach() + w
         elif self.use_qat and self.training:
