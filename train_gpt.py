@@ -499,7 +499,7 @@ _QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
 
 def quantize_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
     w = t.float()
-    gamma = w.abs().amax(dim=1).clamp(min=1e-8)
+    gamma = torch.quantile(w.abs(), 0.75, dim=1).clamp(min=1e-8)
     q = torch.clamp(torch.round(w / gamma[:, None]), -1, 1).to(torch.int8).contiguous()
     return q, gamma.to(torch.float16).contiguous()
 
@@ -733,7 +733,7 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self.use_bitnet:
-            gamma = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+            gamma = torch.quantile(w.abs().float(), 0.75, dim=-1, keepdim=True).clamp(min=1e-5).to(w.dtype)
             w_t = torch.clamp(torch.round(w / gamma), -1, 1)
             w = (w_t * gamma - w).detach() + w
         elif self.use_qat and self.training:
