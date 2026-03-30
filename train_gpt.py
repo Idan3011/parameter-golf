@@ -1074,7 +1074,8 @@ def main() -> None:
         compiled_model = torch.compile(base_model, dynamic=True)
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    _prog = bool(int(os.environ.get("USE_PROGRESSIVE", "0")))
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_prog) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1292,7 +1293,12 @@ def main() -> None:
             if elapsed_frac < 0.20: prog_target = 4
             else: prog_target = args.num_layers
             prog_current = base_model._active_enc + base_model._active_dec
-            if prog_target > prog_current:
+            should_grow = prog_target > prog_current
+            if distributed:
+                grow_tensor = torch.tensor(int(should_grow), device=device)
+                dist.all_reduce(grow_tensor, op=dist.ReduceOp.MIN)
+                should_grow = bool(grow_tensor.item())
+            if should_grow:
                 new_enc = prog_target // 2
                 new_dec = prog_target - new_enc
                 newly_activated = []
