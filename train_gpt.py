@@ -309,8 +309,6 @@ def eval_val_sliding(
     num_batches = (len(my_windows) + batch_size - 1) // batch_size
     with torch.inference_mode():
         for batch_start in range(0, len(my_windows), batch_size):
-            if batch_start % (batch_size * 500) == 0:
-                print(f"  sliding batch {batch_start // batch_size}/{num_batches}", flush=True)
             batch_windows = my_windows[batch_start:batch_start + batch_size]
             x_list, y_list = [], []
             for win_start, _ in batch_windows:
@@ -1072,11 +1070,7 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.use_qat = True
-    if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
-        torch._dynamo.config.recompile_limit = 64
-        compiled_model = torch.compile(base_model, dynamic=True)
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1168,7 +1162,10 @@ def main() -> None:
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
+        growth_ms = getattr(base_model, '_last_growth_ms', 0.0)
+        growth_step = getattr(base_model, '_last_growth_step', 0)
+        steps_since = max(step - growth_step, 1)
+        step_ms = (elapsed_ms - growth_ms) / steps_since if steps_since > 5 else elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
@@ -1317,6 +1314,14 @@ def main() -> None:
                                 ema_state[k].copy_(v.detach().float())
                                 break
                 base_model.grow_to(prog_target)
+                base_model._last_growth_step = step
+                base_model._last_growth_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+                torch._dynamo.reset()
+                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+                if distributed:
+                    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+                else:
+                    model = compiled_model
                 optimizer_muon.state.clear()
                 log0(f"progressive: grew to {prog_target}L at step {step}, blocks {newly_activated}")
         with torch.no_grad():
