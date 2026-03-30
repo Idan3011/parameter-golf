@@ -1328,7 +1328,12 @@ def main() -> None:
                     ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
                     swa_state = None
                     swa_count = 0
-                    log0(f"progressive: RESET EMA/SWA + saved snapshot at step {step}")
+                    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+                    if distributed:
+                        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+                    else:
+                        model = compiled_model
+                    log0(f"progressive: RESET EMA/SWA + fullgraph compile at step {step}")
                 log0(f"progressive: grew to {prog_target}L at step {step}, blocks {newly_activated}")
         _ema_d = 0.95 if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) else args.ema_decay
         with torch.no_grad():
