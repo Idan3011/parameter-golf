@@ -397,17 +397,13 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        best_q, best_s, best_mse = None, None, float("inf")
-        for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
-            ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / 31.0).clamp_min(1.0 / 127.0)
-            q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -31, 31)
-            mse = ((q * s[:, None] - t32) ** 2).mean().item()
-            if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
-        return best_q, best_s
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+        row_max = t32.abs().amax(dim=1).clamp_min(1e-12)
+        s = row_max / 31.0
+        q = torch.clamp(torch.round(t32 / s[:, None]), -31, 31)
+        return q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    clip_abs = float(t32.abs().amax().item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
+    q = torch.clamp(torch.round(t32 / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
@@ -1216,7 +1212,6 @@ def main() -> None:
         ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
         swa_state: dict[str, Tensor] | None = None
         swa_count = 0
-        growth_snapshot: dict[str, Tensor] | None = None
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
@@ -1292,7 +1287,6 @@ def main() -> None:
         if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) and max_wallclock_ms:
             elapsed_frac = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max_wallclock_ms
             if elapsed_frac < 0.20: prog_target = 4
-            elif elapsed_frac < 0.35: prog_target = 7
             else: prog_target = args.num_layers
             prog_current = base_model._active_enc + base_model._active_dec
             if prog_target > prog_current:
@@ -1323,7 +1317,6 @@ def main() -> None:
                 optimizer_muon.state.clear()
                 if prog_target == args.num_layers:
                     ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
-                    growth_snapshot = {k: v.detach().cpu().clone().float() for k, v in base_model.state_dict().items()}
                     swa_state = None
                     swa_count = 0
                     log0(f"progressive: RESET EMA/SWA + saved snapshot at step {step}")
@@ -1370,12 +1363,6 @@ def main() -> None:
                 swa_state[k] /= swa_count
                 ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
             del swa_state
-        if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) and growth_snapshot is not None:
-            alpha = 0.2
-            for k in ema_state:
-                if k in growth_snapshot: ema_state[k] = alpha * growth_snapshot[k] + (1.0 - alpha) * ema_state[k]
-            log0(f"progressive: blended growth snapshot (alpha={alpha})")
-            del growth_snapshot
         log0("ema: loading weights")
         base_model.load_state_dict(ema_state, strict=True)
         for module in base_model.modules():
