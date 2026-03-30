@@ -499,15 +499,12 @@ _QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
 
 
 
-def quantize_float_tensor_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        gamma = t32.abs().mean(dim=1).clamp(min=1e-8)
-        q = torch.clamp(torch.round(t32 / gamma[:, None]), -1, 1).to(torch.int8).contiguous()
-        return q, gamma.to(torch.float16).contiguous()
-    gamma = t32.abs().mean().clamp(min=1e-8)
-    q = torch.clamp(torch.round(t32 / gamma), -1, 1).to(torch.int8).contiguous()
-    return q, gamma.to(torch.float16).contiguous()
+def ternarize_state_dict(sd: dict[str, Tensor]) -> None:
+    for name in sd:
+        if 'blocks.' in name and sd[name].ndim == 2 and sd[name].is_floating_point():
+            w = sd[name].float()
+            gamma = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
+            sd[name] = (torch.clamp(torch.round(w / gamma), -1, 1) * gamma).to(sd[name].dtype)
 
 def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     clip = _QUANT_CLIP
@@ -553,11 +550,7 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        is_block_weight = any(f"blocks.{i}." in name for i in range(100))
-        if bool(int(os.environ.get("USE_BITNET", "0"))) and is_block_weight and t.ndim == 2:
-            q, s = quantize_float_tensor_ternary(t)
-        else:
-            q, s = quantize_float_tensor_int6(t)
+        q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -1426,6 +1419,11 @@ def main() -> None:
             if isinstance(module, CastedLinear):
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
+        if bool(int(os.environ.get("USE_BITNET", "0"))):
+            sd = base_model.state_dict()
+            ternarize_state_dict(sd)
+            base_model.load_state_dict(sd, strict=True)
+            log0("bitnet: weights ternarized for serialization")
         del ema_state
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
