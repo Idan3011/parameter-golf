@@ -394,16 +394,17 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_int6(t: Tensor, bits: int = 6) -> tuple[Tensor, Tensor]:
+    max_val = (1 << (bits - 1)) - 1
     t32 = t.float()
     if t32.ndim == 2:
         row_max = t32.abs().amax(dim=1).clamp_min(1e-12)
-        s = row_max / 31.0
-        q = torch.clamp(torch.round(t32 / s[:, None]), -31, 31)
+        s = row_max / float(max_val)
+        q = torch.clamp(torch.round(t32 / s[:, None]), -max_val, max_val)
         return q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
     clip_abs = float(t32.abs().amax().item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(t32 / scale), -31, 31).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / float(max_val) if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(t32 / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
@@ -433,7 +434,8 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int6(t)
+        bits = 5 if 'mlp' in name else 6
+        q, s = quantize_float_tensor_int6(t, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -620,32 +622,29 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-class _FakeQuantInt6(torch.autograd.Function):
+class _FakeQuant(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w: Tensor) -> Tensor:
-        if w.ndim != 2:
-            return w
+    def forward(ctx, w: Tensor, bits: int = 6) -> Tensor:
+        if w.ndim != 2: return w
+        max_val = (1 << (bits - 1)) - 1
         row_max = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-        scale = row_max / 31.0
-        q = (w / scale).round().clamp(-31, 31)
+        scale = row_max / float(max_val)
+        q = (w / scale).round().clamp(-max_val, max_val)
         return q * scale
-
     @staticmethod
-    def backward(ctx, grad: Tensor) -> Tensor:
-        return grad
-
-def fake_quant_int6(w: Tensor) -> Tensor:
-    return _FakeQuantInt6.apply(w)
+    def backward(ctx, grad: Tensor) -> tuple[Tensor, None]:
+        return grad, None
 
 class CastedLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_qat = False
+        self.qat_bits = 6
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self.use_qat and self.training:
-            w = fake_quant_int6(w)
+            w = _FakeQuant.apply(w, self.qat_bits)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -1066,6 +1065,10 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.use_qat = True
+    for block in base_model.blocks:
+        for mn, m in block.named_modules():
+            if isinstance(m, CastedLinear) and 'mlp' in mn:
+                m.qat_bits = 5
     if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
         torch._dynamo.config.recompile_limit = 64
         compiled_model = torch.compile(base_model, dynamic=True)
