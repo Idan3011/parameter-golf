@@ -503,6 +503,8 @@ def quantize_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(w / gamma[:, None]), -1, 1).to(torch.int8).contiguous()
     return q, gamma.to(torch.float16).contiguous()
 
+_QUANT_CLAMP_MIN = 1e-8 if bool(int(os.environ.get("USE_BITNET", "0"))) else 1.0 / int(os.environ.get("QUANT_CLIP", "31"))
+
 def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     clip = _QUANT_CLIP
     t32 = t.float()
@@ -510,7 +512,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
         best_q, best_s, best_mse = None, None, float("inf")
         for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
             ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / float(clip)).clamp_min(1.0 / clip)
+            s = (ca / float(clip)).clamp_min(_QUANT_CLAMP_MIN)
             q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -clip, clip)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
             if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
@@ -1448,7 +1450,6 @@ def main() -> None:
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
-    torch._dynamo.reset()
     eval_model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device)
     eval_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     eval_model.eval()
@@ -1476,7 +1477,6 @@ def main() -> None:
         log0(f"final_sliding_window val_bpb:{sw_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
         log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
     if ttt_mode > 0:
-        torch._dynamo.reset()
         base_model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device)
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
         torch.cuda.synchronize()
