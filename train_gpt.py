@@ -1162,12 +1162,13 @@ def main() -> None:
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        growth_ms = getattr(base_model, '_last_growth_ms', 0.0)
-        growth_step = getattr(base_model, '_last_growth_step', 0)
-        steps_since = max(step - growth_step, 1)
-        step_ms = (elapsed_ms - growth_ms) / steps_since if steps_since > 5 else elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
+        if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
+            warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", "0.15"))
+            return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     if eval_only:
@@ -1314,10 +1315,8 @@ def main() -> None:
                                 ema_state[k].copy_(v.detach().float())
                                 break
                 base_model.grow_to(prog_target)
-                base_model._last_growth_step = step
-                base_model._last_growth_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
                 torch._dynamo.reset()
-                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, mode="max-autotune")
                 if distributed:
                     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
                 else:
@@ -1327,7 +1326,7 @@ def main() -> None:
         with torch.no_grad():
             for k, v in base_model.state_dict().items():
                 ema_state[k].mul_(args.ema_decay).add_(v.detach().float(), alpha=1.0 - args.ema_decay)
-            if scale < 0.2 and step % 50 == 0:
+            if scale < 0.5 and step % 25 == 0:
                 sd = {k: v.detach().cpu().float() for k, v in base_model.state_dict().items()}
                 if swa_state is None: swa_state, swa_count = sd, 1
                 else:
