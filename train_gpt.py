@@ -936,6 +936,9 @@ class GPT(nn.Module):
             nn.GELU(),
             CastedLinear(pre_enrich_hidden, model_dim, bias=False),
         )
+        self.pre_enrich_gate = nn.Linear(model_dim, 1, bias=True)
+        nn.init.zeros_(self.pre_enrich_gate.weight)
+        nn.init.constant_(self.pre_enrich_gate.bias, 2.0)
         self.num_encoder_layers = (num_layers + 1) // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -995,7 +998,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
         x = self.smear_gate(x)
-        x = self.pre_enrich(x)
+        gate = torch.sigmoid(self.pre_enrich_gate(x))
+        x = x + gate * self.pre_enrich(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         x = self._run_blocks(x, x0)
@@ -1013,7 +1017,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
         x = self.smear_gate(x)
         x_pre = x
-        x = self.pre_enrich(x)
+        gate = torch.sigmoid(self.pre_enrich_gate(x))
+        x = x + gate * self.pre_enrich(x)
         pe_delta = (x - x_pre).norm(dim=-1) if return_pe_delta else None
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
