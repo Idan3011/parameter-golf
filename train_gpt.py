@@ -857,7 +857,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         _prog = bool(int(os.environ.get("USE_PROGRESSIVE", "0")))
-        _prog_init = 4 if _prog else num_layers
+        _prog_init = int(os.environ.get("PROG_INIT_LAYERS", "7")) if _prog else num_layers
         self._active_enc = _prog_init // 2
         self._active_dec = _prog_init - self._active_enc
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
