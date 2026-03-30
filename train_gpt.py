@@ -730,13 +730,17 @@ class CastedLinear(nn.Linear):
         if self.use_bitnet:
             gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
             w_t = torch.clamp(torch.round(w / gamma), -1, 1)
-            w = (w_t - w).detach() + w
-            Qb = 127
-            x_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
-            x_q = torch.clamp(x * Qb / x_max, -Qb, Qb)
-            x_q = (torch.round(x_q) - x_q).detach() + x_q
-            out = F.linear(x_q, w.to(x_q.dtype), self.bias.to(x_q.dtype) if self.bias is not None else None)
-            return out * (gamma.squeeze(-1) * x_max / Qb)
+            w_ternary = w_t * gamma
+            w = (w_ternary - w).detach() + w
+            Qb = 127.0
+            x_scaled = x.float()
+            x_max = x_scaled.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+            x_norm = x_scaled / x_max
+            x_q = torch.clamp(torch.round(x_norm * Qb), -Qb, Qb)
+            x_q = ((x_q / Qb) * x_max).to(x.dtype)
+            x_q = (x_q - x).detach() + x
+            bias = self.bias.to(x_q.dtype) if self.bias is not None else None
+            return F.linear(x_q, w.to(x_q.dtype), bias)
         if self.use_qat and self.training:
             w = fake_quant_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
