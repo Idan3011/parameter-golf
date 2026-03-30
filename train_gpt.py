@@ -1290,7 +1290,7 @@ def main() -> None:
         step += 1
         if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) and max_wallclock_ms:
             elapsed_frac = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max_wallclock_ms
-            if elapsed_frac < 0.20: prog_target = 4
+            if elapsed_frac < 0.10: prog_target = 4
             else: prog_target = args.num_layers
             prog_current = base_model._active_enc + base_model._active_dec
             should_grow = prog_target > prog_current
