@@ -1070,7 +1070,11 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.use_qat = True
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
+        torch._dynamo.config.recompile_limit = 64
+        compiled_model = torch.compile(base_model, dynamic=True)
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1315,12 +1319,6 @@ def main() -> None:
                                 ema_state[k].copy_(v.detach().float())
                                 break
                 base_model.grow_to(prog_target)
-                torch._dynamo.reset()
-                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-                if distributed:
-                    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
-                else:
-                    model = compiled_model
                 optimizer_muon.state.clear()
                 log0(f"progressive: grew to {prog_target}L at step {step}, blocks {newly_activated}")
         with torch.no_grad():
