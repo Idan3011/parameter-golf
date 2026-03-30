@@ -499,12 +499,11 @@ _QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
 
 
 
-def ternarize_state_dict(sd: dict[str, Tensor]) -> None:
-    for name in sd:
-        if 'blocks.' in name and sd[name].ndim == 2 and sd[name].is_floating_point():
-            w = sd[name].float()
-            gamma = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
-            sd[name] = (torch.clamp(torch.round(w / gamma), -1, 1) * gamma).to(sd[name].dtype)
+def quantize_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
+    w = t.float()
+    gamma = w.abs().mean(dim=1).clamp(min=1e-8)
+    q = torch.clamp(torch.round(w / gamma[:, None]), -1, 1).to(torch.int8).contiguous()
+    return q, gamma.to(torch.float16).contiguous()
 
 def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     clip = _QUANT_CLIP
@@ -523,7 +522,7 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -clip, clip).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor], ternary_names: set[str] | None = None):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -550,7 +549,10 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int6(t)
+        if ternary_names and name in ternary_names and t.ndim == 2:
+            q, s = quantize_ternary(t)
+        else:
+            q, s = quantize_float_tensor_int6(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -1419,16 +1421,15 @@ def main() -> None:
             if isinstance(module, CastedLinear):
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
+        ternary_names: set[str] | None = None
         if bool(int(os.environ.get("USE_BITNET", "0"))):
-            sd = base_model.state_dict()
-            ternarize_state_dict(sd)
-            base_model.load_state_dict(sd, strict=True)
-            log0("bitnet: weights ternarized for serialization")
+            ternary_names = {n for n in base_model.state_dict() if 'blocks.' in n and base_model.state_dict()[n].ndim == 2 and base_model.state_dict()[n].is_floating_point()}
+            log0(f"bitnet: {len(ternary_names)} layers will use ternary quantization")
         del ema_state
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
             log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), ternary_names=ternary_names)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
