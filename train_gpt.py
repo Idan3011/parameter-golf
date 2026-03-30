@@ -1316,7 +1316,7 @@ def main() -> None:
                                 break
                 base_model.grow_to(prog_target)
                 torch._dynamo.reset()
-                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, mode="max-autotune")
+                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
                 if distributed:
                     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
                 else:
