@@ -18,6 +18,8 @@ import time
 import uuid
 import lzma
 from pathlib import Path
+
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -29,6 +31,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
+# Default Simple Baseline run:
+# - 9 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - vocab size 1024, sequence length 1024, tied embeddings
+# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+
 _RUN_CONFIG = os.environ.get("RUN_CONFIG", "A")
 
 class Hyperparameters:
@@ -79,8 +87,6 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     leaky_relu = bool(int(os.environ.get("LEAKY_RELU", "0")))
-    leaky_relu_slope = float(os.environ.get("LEAKY_RELU_SLOPE", "0.75"))
-    crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", "0.01"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -300,8 +306,11 @@ def eval_val_sliding(
     total_scored_tokens = torch.zeros((), device=device, dtype=torch.float64)
     total_byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
+    num_batches = (len(my_windows) + batch_size - 1) // batch_size
     with torch.inference_mode():
         for batch_start in range(0, len(my_windows), batch_size):
+            if batch_start % (batch_size * 500) == 0:
+                print(f"  sliding batch {batch_start // batch_size}/{num_batches}", flush=True)
             batch_windows = my_windows[batch_start:batch_start + batch_size]
             x_list, y_list = [], []
             for win_start, _ in batch_windows:
@@ -333,111 +342,6 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bpb)
 
-def _ttt_train_chunk(model, chunk, seq_len, device, vocab_size, opt, n_epochs, rank=0, world_size=1, batch_size=64):
-    seqs = list(range(0, chunk.numel() - seq_len - 1, seq_len))
-    my_seqs = seqs[rank::world_size]
-    distributed = dist.is_available() and dist.is_initialized()
-    for _ in range(n_epochs):
-        for bi in range(0, len(my_seqs), batch_size):
-            bp = my_seqs[bi:bi + batch_size]
-            x = torch.stack([chunk[p:p + seq_len] for p in bp]).to(device=device, dtype=torch.int64)
-            y = torch.stack([chunk[p + 1:p + seq_len + 1] for p in bp]).to(device=device, dtype=torch.int64)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = F.cross_entropy(model.forward_logits(x).float().reshape(-1, vocab_size), y.reshape(-1))
-            loss.backward()
-        if distributed:
-            for p in model.parameters():
-                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-        opt.step()
-        opt.zero_grad()
-
-def eval_val_ttt(
-    args, base_model, rank, world_size, device, val_tokens,
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    ttt_mode=1, stride=64, chunk_tokens=int(os.environ.get("TTT_CHUNK_TOKENS", "2097152")), log_fn=None,
-):
-    seq_len, vocab = args.train_seq_len, args.vocab_size
-    total_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    total_scored_tokens = torch.zeros((), device=device, dtype=torch.float64)
-    total_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    pe_only = ttt_mode in (2, 3)
-    use_ema = ttt_mode in (3, 4)
-    combo = ttt_mode == 5
-    epochs_full = int(os.environ.get("TTT_EPOCHS", "3"))
-    epochs_pe = int(os.environ.get("TTT_EPOCHS_PE", "10"))
-    lr_full = float(os.environ.get("TTT_LR", "0.002"))
-    lr_pe = float(os.environ.get("TTT_LR_PE", "0.0003"))
-    ema_decay = 0.998
-    freeze_blocks = int(os.environ.get("TTT_FREEZE", "0"))
-    for p in base_model.parameters(): p.requires_grad_(False)
-    if pe_only:
-        for p in base_model.pre_enrich.parameters(): p.requires_grad_(True)
-        ttt_opt = torch.optim.SGD(base_model.pre_enrich.parameters(), lr=lr_pe, momentum=0.9)
-    else:
-        for p in base_model.parameters(): p.requires_grad_(True)
-        for i in range(freeze_blocks):
-            for p in base_model.blocks[i].parameters(): p.requires_grad_(False)
-        ttt_opt = torch.optim.SGD([p for p in base_model.parameters() if p.requires_grad], lr=lr_full, momentum=0.9)
-    if combo:
-        for p in base_model.parameters(): p.requires_grad_(True)
-        for i in range(freeze_blocks):
-            for p in base_model.blocks[i].parameters(): p.requires_grad_(False)
-        ttt_opt_pe = torch.optim.SGD(base_model.pre_enrich.parameters(), lr=lr_pe, momentum=0.9)
-        pe_ids = {id(p) for p in base_model.pre_enrich.parameters()}
-        ttt_opt_full = torch.optim.SGD([p for p in base_model.parameters() if p.requires_grad and id(p) not in pe_ids], lr=lr_full, momentum=0.9)
-    ema_state = {n: p.data.clone() for n, p in base_model.named_parameters() if p.requires_grad} if use_ema or combo else None
-    chunk_starts = list(range(0, val_tokens.numel() - seq_len - 1, chunk_tokens))
-    for ci, cs in enumerate(chunk_starts):
-        chunk = val_tokens[cs:min(cs + chunk_tokens + seq_len, val_tokens.numel() - 1) + 1]
-        base_model.eval()
-        with torch.inference_mode():
-            windows, pos = [], 0
-            while pos + seq_len < chunk.numel() - 1:
-                windows.append((pos, 0 if pos == 0 else seq_len - stride))
-                pos += stride
-            my_windows = windows[rank::world_size]
-            score_bs = 256
-            for bi in range(0, len(my_windows), score_bs):
-                bw = my_windows[bi:bi + score_bs]
-                x = torch.stack([chunk[wp:wp + seq_len] for wp, _ in bw]).to(device=device, dtype=torch.int64)
-                y = torch.stack([chunk[wp + 1:wp + seq_len + 1] for wp, _ in bw]).to(device=device, dtype=torch.int64)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x)
-                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), seq_len)
-                for idx, (_, ss) in enumerate(bw):
-                    sl = ptl[idx, ss:]
-                    total_loss_sum += sl.to(torch.float64).sum()
-                    total_scored_tokens += float(sl.numel())
-                    sp, st = x[idx, ss:], y[idx, ss:]
-                    tb = base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)
-                    total_byte_count += tb.to(torch.float64).sum()
-        if ci < len(chunk_starts) - 1:
-            for m in base_model.modules():
-                if hasattr(m, '_cos_cached'): m._cos_cached = None; m._sin_cached = None
-            base_model.train()
-            if combo:
-                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_pe, epochs_pe, rank, world_size)
-                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt_full, epochs_full, rank, world_size)
-            else:
-                _ttt_train_chunk(base_model, chunk, seq_len, device, vocab, ttt_opt, epochs_pe if pe_only else epochs_full, rank, world_size)
-            if ema_state is not None:
-                with torch.no_grad():
-                    for n, p in base_model.named_parameters():
-                        if n in ema_state:
-                            ema_state[n].mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
-                            p.data.copy_(ema_state[n])
-        if log_fn and (ci % 10 == 0 or ci < 3):
-            cur_bpb = (total_loss_sum / (total_byte_count * math.log(2.0))).item() if total_byte_count > 0 else 0
-            log_fn(f"ttt:mode={ttt_mode} chunk={ci}/{len(chunk_starts)} running_bpb={cur_bpb:.4f}")
-    distributed = dist.is_available() and dist.is_initialized()
-    if distributed:
-        dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_scored_tokens, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_byte_count, op=dist.ReduceOp.SUM)
-    for p in base_model.parameters(): p.requires_grad_(True)
-    bpb = (total_loss_sum / (total_byte_count * math.log(2.0))).item()
-    return float(bpb)
 
 
 # -----------------------------
@@ -492,27 +396,23 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-_QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
-
 def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
-    clip = _QUANT_CLIP
-    cmin = 1.0 / clip
     t32 = t.float()
     if t32.ndim == 2:
         best_q, best_s, best_mse = None, None, float("inf")
         for pct in [0.999, 0.9999, 0.99999, 0.999999, 0.9999999]:
             ca = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
-            s = (ca / float(clip)).clamp_min(cmin)
-            q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -clip, clip)
+            s = (ca / 31.0).clamp_min(1.0 / 31.0)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca[:, None], ca[:, None]) / s[:, None]), -31, 31)
             mse = ((q * s[:, None] - t32) ** 2).mean().item()
             if mse < best_mse: best_q, best_s, best_mse = q.to(torch.int8).contiguous(), s.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), mse
         return best_q, best_s
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / float(clip) if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -clip, clip).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor], bitnet_names: set[str] | None = None):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -539,20 +439,13 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], bitnet_names: set[st
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        if bitnet_names and name in bitnet_names:
-            t32 = t.float()
-            row_gamma = t32.abs().amax(dim=-1).clamp(min=1e-8)
-            q = torch.clamp(torch.round(t32 / row_gamma[:, None]), -1, 1).to(torch.int8).contiguous()
-            quantized[name] = q
-            scales[name] = row_gamma.to(torch.float16).contiguous()
+        q, s = quantize_float_tensor_int6(t)
+        if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
-        else:
-            q, s = quantize_float_tensor_int6(t)
-            if s.ndim > 0: qmeta[name] = {"scheme": "per_row", "axis": 0}
-            quantized[name] = q
-            scales[name] = s
+        quantized[name] = q
+        scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(quantized[name]) + tensor_nbytes(scales[name])
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
     obj: dict[str, object] = {
         "__quant_format__": "int6_per_row_v1",
         "quantized": quantized,
@@ -567,15 +460,42 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], bitnet_names: set[st
     return obj, stats
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    quantized, scales, dtypes, passthrough, passthrough_orig_dtypes, qmeta = {}, {}, {}, {}, {}, {}
-    stats = dict.fromkeys(("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
+    # Single supported clean-script export format:
+    # - per-row int8 for 2D float tensors
+    # - per-tensor int8 for other float tensors
+    # - exact passthrough for non-floats
+    # - passthrough for small float tensors, stored as fp16 to save bytes
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        0,
+    )
+
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel()); stats["num_tensors"] += 1; stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
         if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1; passthrough[name] = t; stats["int8_payload_bytes"] += tensor_nbytes(t); continue
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # Small float tensors are cheap enough to keep directly. We still downcast
+        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes); passthrough[name] = kept; stats["int8_payload_bytes"] += tensor_nbytes(kept); continue
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor(t)
         if s.ndim > 0:
@@ -607,10 +527,13 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
+            # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
-            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+            scale = float(s.item())
+            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
+        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -724,15 +647,10 @@ class CastedLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_qat = False
-        self.use_bitnet = False
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self.use_bitnet:
-            gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
-            w_t = torch.clamp(torch.round(w / gamma), -1, 1)
-            w = (w_t * gamma - w).detach() + w
-        elif self.use_qat and self.training:
+        if self.use_qat and self.training:
             w = fake_quant_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
@@ -847,8 +765,6 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y), v
 
 
-_LEAKY_SLOPE = float(os.environ.get("LEAKY_RELU_SLOPE", "0.75"))
-
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, leaky: bool = False):
         super().__init__()
@@ -859,7 +775,7 @@ class MLP(nn.Module):
         self._leaky = leaky
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), _LEAKY_SLOPE) if self._leaky else torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), 0.5) if self._leaky else torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -948,7 +864,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        xsa_last_n = int(os.environ.get("XSA_LAST_N", num_layers))
+        xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
         mlp_mult_enc = int(os.environ.get("MLP_MULT_ENCODER", mlp_mult))
         mlp_mult_dec = int(os.environ.get("MLP_MULT_DECODER", mlp_mult))
         leaky = bool(int(os.environ.get("LEAKY_RELU", "0")))
@@ -964,7 +880,6 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self.mtp_head = CastedLinear(model_dim * 2, vocab_size, bias=False) if bool(int(os.environ.get("MTP", "0"))) else None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1007,15 +922,10 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         x = self._run_blocks(x, x0)
-        x = self.final_norm(x)
-        logits = self._compute_logits(x.reshape(-1, x.size(-1)))
-        loss = F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
-        if self.mtp_head is not None and self.training:
-            h_cat = torch.cat([x[:, :-1, :], x[:, 1:, :]], dim=-1)
-            mtp_logits = self.mtp_head(h_cat).float().reshape(-1, logits.size(-1))
-            mtp_targets = target_ids[:, 1:].reshape(-1)
-            loss = loss + 0.3 * F.cross_entropy(mtp_logits, mtp_targets, reduction="mean")
-        return loss
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
+        logits = self._compute_logits(x)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor, return_pe_delta: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
@@ -1151,12 +1061,6 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.use_qat = True
-    if bool(int(os.environ.get("USE_BITNET", "0"))):
-        for block in base_model.blocks:
-            for m in block.modules():
-                if isinstance(m, CastedLinear):
-                    m.use_bitnet = True
-                    m.use_qat = False
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1230,7 +1134,11 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+
+    # -----------------------------
     # DATA LOADER & MODEL WARMUP
+    # -----------------------------
+
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
@@ -1281,7 +1189,10 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    # -----------------------------
     # MAIN TRAINING LOOP
+    # -----------------------------
+
     training_time_ms = 0.0
     if not eval_only:
         stop_after_step: int | None = None
@@ -1336,14 +1247,6 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
-            if args.crownq_lambda > 0 and scale < 1.0 and micro_step == grad_accum_steps - 1:
-                crownq_pen = torch.zeros((), device=device)
-                for m in base_model.modules():
-                    if isinstance(m, CastedLinear) and m.weight.ndim == 2 and not getattr(m, 'use_bitnet', False):
-                        w = m.weight.float()
-                        rm = w.abs().amax(dim=1).clamp_min(1e-12)
-                        crownq_pen += ((w ** 2).mean(dim=1) * (rm / 15.0) ** 2 / 12.0).sum()
-                loss = loss + args.crownq_lambda * crownq_pen
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1383,7 +1286,10 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms")
+            log0(
+                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+            )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1395,7 +1301,10 @@ def main() -> None:
             stop_after_step = step
 
     if not eval_only:
-        log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
+        log0(
+            f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+        )
         ema_state = {k: v.cpu() for k, v in ema_state.items()}
         if swa_state is not None and swa_count > 0:
             log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
@@ -1409,27 +1318,19 @@ def main() -> None:
             if isinstance(module, CastedLinear):
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
-        _bitnet_names: set[str] | None = None
-        if bool(int(os.environ.get("USE_BITNET", "0"))):
-            _bitnet_names = set()
-            with torch.no_grad():
-                for bi, block in enumerate(base_model.blocks):
-                    for mn, m in block.named_modules():
-                        if isinstance(m, CastedLinear) and m.use_bitnet:
-                            w = m.weight.data
-                            gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
-                            m.weight.data = (torch.clamp(torch.round(w / gamma), -1, 1) * gamma).to(w.dtype)
-                            _bitnet_names.add(f"blocks.{bi}.{mn}.weight")
-            log0(f"bitnet: projected {len(_bitnet_names)} layers to ternary")
         del ema_state
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
-            log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), bitnet_names=_bitnet_names)
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
+            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
-        quant_blob = lzma.compress(quant_raw, preset=9)
+        quant_blob = lzma.compress(quant_raw, preset=6)
         quant_raw_bytes = len(quant_raw)
         if master_process:
             with open("final_model.int6.ptz", "wb") as f:
@@ -1448,13 +1349,11 @@ def main() -> None:
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
-    eval_model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device)
-    eval_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    eval_model.eval()
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args, eval_model, rank, world_size, device, grad_accum_steps,
+        args, model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
@@ -1463,31 +1362,23 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    ttt_mode = int(os.environ.get("TTT_MODE", "0"))
-    if ttt_mode == 0:
-        torch.cuda.synchronize()
-        t_slide = time.perf_counter()
-        sw_val_loss, sw_val_bpb = eval_val_sliding(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-        torch.cuda.synchronize()
-        log0(f"final_sliding_window val_bpb:{sw_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
-        log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
-    if ttt_mode > 0:
-        base_model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device)
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-        torch.cuda.synchronize()
-        t_ttt = time.perf_counter()
-        log0(f"ttt:starting mode={ttt_mode}")
-        ttt_bpb = eval_val_ttt(
-            args, base_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            ttt_mode=ttt_mode, log_fn=log0,
-        )
-        torch.cuda.synchronize()
-        log0(f"final_ttt_mode{ttt_mode} val_bpb:{ttt_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
-        log0(f"final_ttt_mode{ttt_mode}_exact val_bpb:{ttt_bpb:.8f}")
 
-    if distributed: dist.destroy_process_group()
-if __name__ == "__main__": main()
+    torch.cuda.synchronize()
+    t_slide = time.perf_counter()
+    sw_val_loss, sw_val_bpb = eval_val_sliding(
+        args, base_model, rank, world_size, device,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_sliding_window val_bpb:{sw_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+    )
+    log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
+
+    if distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
