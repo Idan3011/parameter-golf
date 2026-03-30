@@ -497,11 +497,9 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 
 _QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
 
-
-
 def quantize_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
     w = t.float()
-    gamma = w.abs().mean(dim=1).clamp(min=1e-8)
+    gamma = w.abs().amax(dim=1).clamp(min=1e-8)
     q = torch.clamp(torch.round(w / gamma[:, None]), -1, 1).to(torch.int8).contiguous()
     return q, gamma.to(torch.float16).contiguous()
 
@@ -730,10 +728,15 @@ class CastedLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_qat = False
+        self.use_bitnet = False
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self.use_qat and self.training:
+        if self.use_bitnet:
+            gamma = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+            w_t = torch.clamp(torch.round(w / gamma), -1, 1)
+            w = (w_t * gamma - w).detach() + w
+        elif self.use_qat and self.training:
             w = fake_quant_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
@@ -1389,10 +1392,7 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-            )
+            log0(f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
