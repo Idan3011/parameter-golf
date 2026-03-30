@@ -18,8 +18,6 @@ import time
 import uuid
 import lzma
 from pathlib import Path
-
-
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -302,7 +300,6 @@ def eval_val_sliding(
     total_scored_tokens = torch.zeros((), device=device, dtype=torch.float64)
     total_byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    num_batches = (len(my_windows) + batch_size - 1) // batch_size
     with torch.inference_mode():
         for batch_start in range(0, len(my_windows), batch_size):
             batch_windows = my_windows[batch_start:batch_start + batch_size]
@@ -497,15 +494,9 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 
 _QUANT_CLIP = int(os.environ.get("QUANT_CLIP", "31"))
 
-def quantize_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
-    w = t.float()
-    gamma = torch.quantile(w.abs(), 0.75, dim=1).clamp(min=1e-8)
-    q = torch.clamp(torch.round(w / gamma[:, None]), -1, 1).to(torch.int8).contiguous()
-    return q, gamma.to(torch.float16).contiguous()
-
-def quantize_float_tensor_int6(t: Tensor, clamp_min: float = 0.0) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     clip = _QUANT_CLIP
-    cmin = clamp_min if clamp_min > 0 else 1.0 / clip
+    cmin = 1.0 / clip
     t32 = t.float()
     if t32.ndim == 2:
         best_q, best_s, best_mse = None, None, float("inf")
@@ -548,14 +539,20 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], bitnet_names: set[st
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        cmin = 1e-8 if bitnet_names and name in bitnet_names else 0.0
-        q, s = quantize_float_tensor_int6(t, clamp_min=cmin)
-        if s.ndim > 0:
+        if bitnet_names and name in bitnet_names:
+            t32 = t.float()
+            row_gamma = t32.abs().amax(dim=-1).clamp(min=1e-8)
+            q = torch.clamp(torch.round(t32 / row_gamma[:, None]), -1, 1).to(torch.int8).contiguous()
+            quantized[name] = q
+            scales[name] = row_gamma.to(torch.float16).contiguous()
             qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
+        else:
+            q, s = quantize_float_tensor_int6(t)
+            if s.ndim > 0: qmeta[name] = {"scheme": "per_row", "axis": 0}
+            quantized[name] = q
+            scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        stats["int8_payload_bytes"] += tensor_nbytes(quantized[name]) + tensor_nbytes(scales[name])
     obj: dict[str, object] = {
         "__quant_format__": "int6_per_row_v1",
         "quantized": quantized,
@@ -732,7 +729,7 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self.use_bitnet:
-            gamma = (1.0 / _QUANT_CLIP) * torch.ones(w.shape[0], 1, device=w.device, dtype=w.dtype)
+            gamma = w.detach().abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
             w_t = torch.clamp(torch.round(w / gamma), -1, 1)
             w = (w_t * gamma - w).detach() + w
         elif self.use_qat and self.training:
@@ -1157,7 +1154,9 @@ def main() -> None:
     if bool(int(os.environ.get("USE_BITNET", "0"))):
         for block in base_model.blocks:
             for m in block.modules():
-                if isinstance(m, CastedLinear): m.use_bitnet = True
+                if isinstance(m, CastedLinear):
+                    m.use_bitnet = True
+                    m.use_qat = False
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1347,7 +1346,7 @@ def main() -> None:
             if args.crownq_lambda > 0 and scale < 1.0 and micro_step == grad_accum_steps - 1:
                 crownq_pen = torch.zeros((), device=device)
                 for m in base_model.modules():
-                    if isinstance(m, CastedLinear) and m.weight.ndim == 2:
+                    if isinstance(m, CastedLinear) and m.weight.ndim == 2 and not getattr(m, 'use_bitnet', False):
                         w = m.weight.float()
                         rm = w.abs().amax(dim=1).clamp_min(1e-12)
                         crownq_pen += ((w ** 2).mean(dim=1) * (rm / 15.0) ** 2 / 12.0).sum()
@@ -1403,10 +1402,7 @@ def main() -> None:
             stop_after_step = step
 
     if not eval_only:
-        log0(
-            f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-        )
+        log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
         ema_state = {k: v.cpu() for k, v in ema_state.items()}
         if swa_state is not None and swa_count > 0:
             log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
@@ -1420,11 +1416,23 @@ def main() -> None:
             if isinstance(module, CastedLinear):
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
+        _bitnet_names: set[str] | None = None
+        if bool(int(os.environ.get("USE_BITNET", "0"))):
+            _bitnet_names = set()
+            with torch.no_grad():
+                for bi, block in enumerate(base_model.blocks):
+                    for mn, m in block.named_modules():
+                        if isinstance(m, CastedLinear) and m.use_bitnet:
+                            w = m.weight.data
+                            gamma = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+                            m.weight.data = (torch.clamp(torch.round(w / gamma), -1, 1) * gamma).to(w.dtype)
+                            _bitnet_names.add(f"blocks.{bi}.{mn}.weight")
+            log0(f"bitnet: projected {len(_bitnet_names)} layers to ternary")
         del ema_state
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
             log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
-        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
+        quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict(), bitnet_names=_bitnet_names)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
