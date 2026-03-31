@@ -359,9 +359,6 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
@@ -372,27 +369,6 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
-
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
 
 def quantize_float_tensor_int6(t: Tensor, bits: int = 6) -> tuple[Tensor, Tensor]:
     max_val = (1 << (bits - 1)) - 1
@@ -455,65 +431,6 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
-        0,
-    )
-
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
-            continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
-
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
@@ -538,8 +455,124 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def generate_ar_calibration(model: nn.Module, device: torch.device, vocab_size: int = 1024,
+                            seed: int = 42) -> list[Tensor]:
+    n_seqs = int(os.environ.get("GPTQ_CALIB_SEQS", "16"))
+    seq_len = int(os.environ.get("GPTQ_CALIB_LEN", "512"))
+    batch_size = min(8, n_seqs)
+    model.eval()
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+    all_seqs: list[Tensor] = []
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for batch_start in range(0, n_seqs, batch_size):
+            bs = min(batch_size, n_seqs - batch_start)
+            tokens = torch.randint(0, vocab_size, (bs, 1), device=device, generator=rng)
+            for _ in range(seq_len - 1):
+                logits = model.forward_logits(tokens)
+                probs = torch.softmax(logits[:, -1, :], dim=-1)
+                tokens = torch.cat([tokens, torch.multinomial(probs, 1, generator=rng)], dim=1)
+            all_seqs.append(tokens)
+    return all_seqs
+
+
+def collect_hessians(model: nn.Module, calib_seqs: list[Tensor], device: torch.device) -> dict[str, Tensor]:
+    hessians: dict[str, Tensor] = {}
+    hooks: list[torch.utils.hooks.RemovableHook] = []
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear) and module.weight.ndim == 2:
+            pname = name + ".weight"
+            cols = module.weight.shape[1]
+            hessians[pname] = torch.zeros(cols, cols, dtype=torch.float32, device=device)
+            def make_hook(pn: str):
+                def hook_fn(mod, inp, out):
+                    x = inp[0].detach().float()
+                    if x.ndim == 3:
+                        x = x.reshape(-1, x.shape[-1])
+                    hessians[pn] += x.T @ x
+                return hook_fn
+            hooks.append(module.register_forward_hook(make_hook(pname)))
+    model.eval()
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for seq in calib_seqs:
+            x, y = seq[:, :-1].to(device), seq[:, 1:].to(device)
+            model(x, y)
+    for h in hooks:
+        h.remove()
+    for pname in hessians:
+        H = hessians[pname]
+        H /= len(calib_seqs)
+        damp = 0.01 * torch.diag(H).mean().clamp_min(1e-6)
+        H += damp * torch.eye(H.shape[0], device=H.device)
+    return hessians
+
+
+def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
+                         block_size: int = 128) -> Tensor:
+    rows, cols = weight.shape
+    H = hessian.float().clone()
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    damp = 0.01 * torch.mean(torch.diag(H))
+    H.diagonal().add_(damp)
+    perm = torch.argsort(torch.diag(H), descending=True)
+    inv_perm = torch.argsort(perm)
+    W = weight.float()[:, perm].clone()
+    H = H[perm][:, perm]
+    Hinv = torch.linalg.cholesky(H)
+    Hinv = torch.cholesky_inverse(Hinv)
+    Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    sf = (weight.float().abs().amax(dim=1).clamp_min(1e-12) / clip_range).to(device=W.device)
+    Q = torch.zeros(rows, cols, dtype=torch.float32, device=W.device)
+    for i1 in range(0, cols, block_size):
+        i2 = min(i1 + block_size, cols)
+        W1 = W[:, i1:i2].clone()
+        Err1 = torch.zeros(rows, i2 - i1, device=W.device)
+        Hinv1 = Hinv[i1:i2, i1:i2]
+        for i in range(i2 - i1):
+            w = W1[:, i]
+            d = Hinv1[i, i].clamp_min(1e-10)
+            q = torch.clamp(torch.round(w / sf), -clip_range, clip_range)
+            Q[:, i1 + i] = q
+            err = (w - q * sf) / d
+            if i + 1 < i2 - i1:
+                W1[:, i + 1:] -= err.unsqueeze(1) * Hinv1[i, i + 1:].unsqueeze(0)
+            Err1[:, i] = err
+        if i2 < cols:
+            W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+    Q = Q[:, inv_perm]
+    return (Q * sf[:, None]).to(dtype=weight.dtype)
+
+
+def apply_gptq_inplace(model: nn.Module, device: torch.device, args, log_fn=print) -> None:
+    t0 = time.perf_counter()
+    log_fn("gptq: generating AR calibration data...")
+    calib = generate_ar_calibration(model, device, vocab_size=args.vocab_size, seed=args.seed)
+    log_fn(f"gptq: AR gen done in {time.perf_counter() - t0:.1f}s")
+    t1 = time.perf_counter()
+    log_fn("gptq: collecting Hessians...")
+    hessians = collect_hessians(model, calib, device)
+    del calib
+    torch.cuda.empty_cache()
+    log_fn(f"gptq: Hessians for {len(hessians)} layers in {time.perf_counter() - t1:.1f}s")
+    t2 = time.perf_counter()
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear) and module.weight.ndim == 2:
+            pname = name + ".weight"
+            H = hessians.get(pname)
+            if H is None:
+                continue
+            bits = 5 if 'mlp' in name else 6
+            cr = (1 << (bits - 1)) - 1
+            with torch.no_grad():
+                module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H, clip_range=cr))
+            count += 1
+    log_fn(f"gptq: quantized {count} layers in {time.perf_counter() - t2:.1f}s, total {time.perf_counter() - t0:.1f}s")
+
+
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -857,7 +890,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         _prog = bool(int(os.environ.get("USE_PROGRESSIVE", "0")))
-        _prog_init = int(os.environ.get("PROG_INIT_LAYERS", "7")) if _prog else num_layers
+        _prog_init = int(os.environ.get("PROG_START_LAYERS", os.environ.get("PROG_INIT_LAYERS", "7"))) if _prog else num_layers
         self._active_enc = _prog_init // 2
         self._active_dec = _prog_init - self._active_enc
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
@@ -1290,7 +1323,9 @@ def main() -> None:
         step += 1
         if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))) and max_wallclock_ms:
             elapsed_frac = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max_wallclock_ms
-            if elapsed_frac < 0.20: prog_target = 4
+            _prog_start = int(os.environ.get("PROG_START_LAYERS", os.environ.get("PROG_INIT_LAYERS", "7")))
+            _phase1_frac = float(os.environ.get("PROG_PHASE1_FRAC", "0.20"))
+            if elapsed_frac < _phase1_frac: prog_target = _prog_start
             else: prog_target = args.num_layers
             prog_current = base_model._active_enc + base_model._active_dec
             should_grow = prog_target > prog_current
@@ -1384,6 +1419,8 @@ def main() -> None:
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
         del ema_state
+        if bool(int(os.environ.get("USE_GPTQ", "0"))):
+            apply_gptq_inplace(base_model, device, args, log_fn=log0)
         if master_process:
             torch.save(base_model.state_dict(), "final_model.pt")
             model_bytes = os.path.getsize("final_model.pt")
