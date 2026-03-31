@@ -38,15 +38,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# -----------------------------
 # HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 _RUN_CONFIG = os.environ.get("RUN_CONFIG", "A")
 
 class Hyperparameters:
@@ -497,7 +489,7 @@ def collect_hessians(model: nn.Module, calib_seqs: list[Tensor], device: torch.d
 
 
 def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
-                         block_size: int = 128) -> Tensor:
+                         block_size: int = 128, sparsity: float = 0.0) -> Tensor:
     rows, cols = weight.shape
     H = hessian.float().clone()
     dead = torch.diag(H) == 0
@@ -519,6 +511,12 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
                 return weight
     sf = (weight.float().abs().amax(dim=1).clamp_min(1e-12) / clip_range).to(device=W.device)
     Q = torch.zeros(rows, cols, dtype=torch.float32, device=W.device)
+    if sparsity > 0:
+        W_ref = W.clone()
+        Hdiag = torch.diag(Hd) if 'Hd' in dir() else torch.diag(H)
+        score = W_ref.pow(2) * Hdiag[None, :]
+        threshold = torch.quantile(score.flatten(), sparsity)
+        prune_mask = score <= threshold
     for i1 in range(0, cols, block_size):
         i2 = min(i1 + block_size, cols)
         W1 = W[:, i1:i2].clone()
@@ -528,6 +526,8 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
             w = W1[:, i]
             d = Hinv1[i, i].clamp_min(1e-10)
             q = torch.clamp(torch.round(w / sf), -clip_range, clip_range)
+            if sparsity > 0:
+                q[prune_mask[:, i1 + i]] = 0
             Q[:, i1 + i] = q
             err = (w - q * sf) / d
             if i + 1 < i2 - i1:
@@ -560,10 +560,11 @@ def apply_gptq_inplace(model: nn.Module, device: torch.device, args, log_fn=prin
                 continue
             bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else 6
             cr = (1 << (bits - 1)) - 1
+            sp = float(os.environ.get("GPTQ_SPARSITY", "0.0"))
             with torch.no_grad():
-                module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H, clip_range=cr))
+                module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H, clip_range=cr, sparsity=sp))
             count += 1
-    log_fn(f"gptq: quantized {count} layers in {time.perf_counter() - t2:.1f}s, total {time.perf_counter() - t0:.1f}s")
+    log_fn(f"gptq: quantized {count} layers (sparsity={float(os.environ.get('GPTQ_SPARSITY', '0.0'))}) in {time.perf_counter() - t2:.1f}s, total {time.perf_counter() - t0:.1f}s")
 
 
 # -----------------------------
