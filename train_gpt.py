@@ -567,9 +567,7 @@ def apply_gptq_inplace(model: nn.Module, device: torch.device, args, log_fn=prin
     log_fn(f"gptq: quantized {count} layers (sparsity={float(os.environ.get('GPTQ_SPARSITY', '0.0'))}) in {time.perf_counter() - t2:.1f}s, total {time.perf_counter() - t0:.1f}s")
 
 
-# -----------------------------
 # DATA LOADING
-# -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -876,12 +874,15 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash = BigramHash(2048, 128, model_dim)
         self.smear_gate = SmearGate(model_dim)
-        pre_enrich_hidden = model_dim * 3 // 2
-        self.pre_enrich = nn.Sequential(
-            CastedLinear(model_dim, pre_enrich_hidden, bias=False),
-            nn.GELU(),
-            CastedLinear(pre_enrich_hidden, model_dim, bias=False),
-        )
+        if bool(int(os.environ.get("USE_PRE_ENRICH", "1"))):
+            pre_enrich_hidden = model_dim * 3 // 2
+            self.pre_enrich = nn.Sequential(
+                CastedLinear(model_dim, pre_enrich_hidden, bias=False),
+                nn.GELU(),
+                CastedLinear(pre_enrich_hidden, model_dim, bias=False),
+            )
+        else:
+            self.pre_enrich = nn.Identity()
         self.num_encoder_layers = (num_layers + 1) // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1373,7 +1374,6 @@ def main() -> None:
                 base_model.grow_to(prog_target)
                 optimizer_muon.state.clear()
                 if prog_target == args.num_layers:
-                    ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
                     swa_state = None
                     swa_count = 0
                     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if _use_compile else base_model
