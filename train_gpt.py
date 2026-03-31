@@ -18,6 +18,16 @@ import time
 import uuid
 import lzma
 from pathlib import Path
+try:
+    import brotli
+    _COMPRESSOR = "brotli"
+except ImportError:
+    _COMPRESSOR = "lzma"
+def _decompress(data: bytes) -> bytes:
+    try:
+        return brotli.decompress(data)
+    except Exception:
+        return lzma.decompress(data)
 
 
 import numpy as np
@@ -331,14 +341,7 @@ def eval_val_sliding(
 
 
 
-# -----------------------------
 # POST-TRAINING QUANTIZATION
-# -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
-
 _ctrl_default = "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights"
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p for p in os.environ.get("CONTROL_TENSOR_NAME_PATTERNS", _ctrl_default).split(",") if p)
@@ -1209,7 +1212,7 @@ def main() -> None:
         log0("eval_only: loading final_model.int6.ptz")
         with open("final_model.int6.ptz", "rb") as f:
             base_model.load_state_dict(dequantize_state_dict_int8(
-                torch.load(io.BytesIO(lzma.decompress(f.read())), map_location="cpu")), strict=True)
+                torch.load(io.BytesIO(_decompress(f.read())), map_location="cpu")), strict=True)
     elif args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1441,7 +1444,7 @@ def main() -> None:
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
-        quant_blob = lzma.compress(quant_raw, preset=9)
+        quant_blob = brotli.compress(quant_raw, quality=11) if _COMPRESSOR == "brotli" else lzma.compress(quant_raw, preset=9)
         quant_raw_bytes = len(quant_raw)
         if master_process:
             with open("final_model.int6.ptz", "wb") as f:
@@ -1459,7 +1462,7 @@ def main() -> None:
 
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
