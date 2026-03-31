@@ -87,13 +87,9 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     leaky_relu = bool(int(os.environ.get("LEAKY_RELU", "0")))
+    crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", 0.01))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
+# MUON OPTIMIZER (borrowed from modded-nanogpt)
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -170,14 +166,7 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -410,7 +399,7 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        bits = 5 if 'mlp' in name else 6
+        bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else 6
         q, s = quantize_float_tensor_int6(t, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -566,7 +555,7 @@ def apply_gptq_inplace(model: nn.Module, device: torch.device, args, log_fn=prin
             H = hessians.get(pname)
             if H is None:
                 continue
-            bits = 5 if 'mlp' in name else 6
+            bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else 6
             cr = (1 << (bits - 1)) - 1
             with torch.no_grad():
                 module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H, clip_range=cr))
@@ -1106,7 +1095,7 @@ def main() -> None:
     for block in base_model.blocks:
         for mn, m in block.named_modules():
             if isinstance(m, CastedLinear) and 'mlp' in mn:
-                m.qat_bits = 5
+                m.qat_bits = int(os.environ.get("MLP_QUANT_BITS", "5"))
     if _use_compile:
         if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
             torch._dynamo.config.recompile_limit = 64
@@ -1305,6 +1294,18 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            if args.crownq_lambda > 0 and scale < 1.0 and micro_step == grad_accum_steps - 1:
+                _mlp_bits = int(os.environ.get("MLP_QUANT_BITS", "5"))
+                _mlp_cr = (1 << (_mlp_bits - 1)) - 1
+                crownq_pen = torch.zeros((), device=device)
+                for mn, m in base_model.named_modules():
+                    if isinstance(m, CastedLinear) and m.weight.ndim == 2:
+                        w = m.weight.float()
+                        cr = _mlp_cr if 'mlp' in mn else 31
+                        row_max = w.abs().amax(dim=1).clamp_min(1e-12)
+                        delta = row_max / cr
+                        crownq_pen = crownq_pen + ((w ** 2).mean(dim=1) * delta * delta / 12.0).sum()
+                loss = loss + args.crownq_lambda * crownq_pen
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
