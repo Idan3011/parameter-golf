@@ -988,7 +988,9 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    _use_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
+    if _use_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1102,11 +1104,14 @@ def main() -> None:
         for mn, m in block.named_modules():
             if isinstance(m, CastedLinear) and 'mlp' in mn:
                 m.qat_bits = 5
-    if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
-        torch._dynamo.config.recompile_limit = 64
-        compiled_model = torch.compile(base_model, dynamic=True)
+    if _use_compile:
+        if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
+            torch._dynamo.config.recompile_limit = 64
+            compiled_model = torch.compile(base_model, dynamic=True)
+        else:
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        compiled_model = base_model
     _prog = bool(int(os.environ.get("USE_PROGRESSIVE", "0")))
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_prog) if distributed else compiled_model
 
@@ -1363,7 +1368,7 @@ def main() -> None:
                     ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
                     swa_state = None
                     swa_count = 0
-                    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+                    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if _use_compile else base_model
                     if distributed:
                         model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
                     else:
