@@ -500,10 +500,7 @@ def collect_hessians(model: nn.Module, calib_seqs: list[Tensor], device: torch.d
     for h in hooks:
         h.remove()
     for pname in hessians:
-        H = hessians[pname]
-        H /= len(calib_seqs)
-        damp = 0.01 * torch.diag(H).mean().clamp_min(1e-6)
-        H += damp * torch.eye(H.shape[0], device=H.device)
+        hessians[pname] /= len(calib_seqs)
     return hessians
 
 
@@ -513,15 +510,21 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
     H = hessian.float().clone()
     dead = torch.diag(H) == 0
     H[dead, dead] = 1
-    damp = 0.01 * torch.mean(torch.diag(H))
-    H.diagonal().add_(damp)
     perm = torch.argsort(torch.diag(H), descending=True)
     inv_perm = torch.argsort(perm)
     W = weight.float()[:, perm].clone()
     H = H[perm][:, perm]
-    Hinv = torch.linalg.cholesky(H)
-    Hinv = torch.cholesky_inverse(Hinv)
-    Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    for damp_scale in [0.01, 0.1, 1.0]:
+        try:
+            Hd = H.clone()
+            Hd.diagonal().add_(damp_scale * torch.mean(torch.diag(H)).clamp_min(1e-6))
+            Hinv = torch.linalg.cholesky(Hd)
+            Hinv = torch.cholesky_inverse(Hinv)
+            Hinv = torch.linalg.cholesky(Hinv, upper=True)
+            break
+        except torch._C._LinAlgError:
+            if damp_scale >= 1.0:
+                return weight
     sf = (weight.float().abs().amax(dim=1).clamp_min(1e-12) / clip_range).to(device=W.device)
     Q = torch.zeros(rows, cols, dtype=torch.float32, device=W.device)
     for i1 in range(0, cols, block_size):
