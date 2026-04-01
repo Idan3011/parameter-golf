@@ -90,7 +90,6 @@ class Hyperparameters:
     leaky_relu = bool(int(os.environ.get("LEAKY_RELU", "0")))
     crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", 0.01))
 
-# MUON OPTIMIZER (borrowed from modded-nanogpt)
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -164,8 +163,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-
-# TOKENIZER-AGNOSTIC EVALUATION SETUP
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -273,6 +270,8 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
     ema_d = float(os.environ.get("TTT_EMA_DECAY", "0.998"))
     freeze_n = int(os.environ.get("TTT_FREEZE_BLOCKS", "2"))
+    score_bs = int(os.environ.get("TTT_SCORE_BATCH", "64"))
+    train_bs = int(os.environ.get("TTT_TRAIN_BATCH", "32"))
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
@@ -281,33 +280,39 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         for p in base_model.blocks[i].parameters(): p.requires_grad_(True)
     opt = torch.optim.AdamW([p for p in base_model.parameters() if p.requires_grad], lr=ttt_lr, weight_decay=0.01)
     ema = {n: p.data.clone() for n, p in base_model.named_parameters() if p.requires_grad}
+    n_chunks = (N - S - 1 + chunk_tok - 1) // chunk_tok
     for ci, cs in enumerate(range(0, N - S - 1, chunk_tok)):
         chunk = val_tokens[cs:min(cs + chunk_tok + S, N - 1) + 1]
+        windows = []
+        pos = 0
+        while pos + S < chunk.numel() - 1:
+            windows.append((pos, 0 if pos == 0 else S - stride))
+            pos += stride
         base_model.eval()
         with torch.inference_mode():
-            pos = 0
-            while pos + S < chunk.numel() - 1:
-                ss = 0 if pos == 0 else S - stride
-                x = chunk[pos:pos+S].unsqueeze(0).to(device=device, dtype=torch.int64)
-                y = chunk[pos+1:pos+S+1].unsqueeze(0).to(device=device, dtype=torch.int64)
+            for bi in range(0, len(windows), score_bs):
+                bw = windows[bi:bi + score_bs]
+                x = torch.stack([chunk[p:p+S] for p, _ in bw]).to(device=device, dtype=torch.int64)
+                y = torch.stack([chunk[p+1:p+S+1] for p, _ in bw]).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x)
-                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none")
-                sl = ptl[ss:]; L += sl.to(torch.float64).sum(); T += float(sl.numel())
-                sp, st = x.squeeze(0)[ss:], y.squeeze(0)[ss:]
-                B += (base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)).to(torch.float64).sum()
-                pos += stride
-        n_chunks = (N - S - 1 + chunk_tok - 1) // chunk_tok
+                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), S)
+                for j, (_, ss) in enumerate(bw):
+                    sl = ptl[j, ss:]; L += sl.to(torch.float64).sum(); T += float(sl.numel())
+                    sp, st = x[j, ss:], y[j, ss:]
+                    B += (base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)).to(torch.float64).sum()
         if ci < n_chunks - 1:
             base_model.train()
             for _ in range(ttt_epochs):
                 pos = 0
                 while pos + S < chunk.numel() - 1:
-                    xb = chunk[pos:pos+S].unsqueeze(0).to(device=device, dtype=torch.int64)
-                    yb = chunk[pos+1:pos+S+1].unsqueeze(0).to(device=device, dtype=torch.int64)
+                    end = min(pos + train_bs * S, chunk.numel() - 1)
+                    n_seq = (end - pos) // S
+                    xb = chunk[pos:pos + n_seq * S].reshape(n_seq, S).to(device=device, dtype=torch.int64)
+                    yb = chunk[pos + 1:pos + n_seq * S + 1].reshape(n_seq, S).to(device=device, dtype=torch.int64)
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         F.cross_entropy(base_model.forward_logits(xb).float().reshape(-1, args.vocab_size), yb.reshape(-1)).backward()
-                    opt.step(); opt.zero_grad(); pos += S
+                    opt.step(); opt.zero_grad(); pos += n_seq * S
             with torch.no_grad():
                 for n, p in base_model.named_parameters():
                     if n in ema: ema[n].mul_(ema_d).add_(p.data, alpha=1-ema_d); p.data.copy_(ema[n])
@@ -376,7 +381,6 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bpb)
 
-# POST-TRAINING QUANTIZATION
 _ctrl_default = "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights"
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p for p in os.environ.get("CONTROL_TENSOR_NAME_PATTERNS", _ctrl_default).split(",") if p)
@@ -605,7 +609,6 @@ def apply_gptq_inplace(model: nn.Module, device: torch.device, args, log_fn=prin
             count += 1
     log_fn(f"gptq: quantized {count} layers (sparsity={float(os.environ.get('GPTQ_SPARSITY', '0.0'))}) in {time.perf_counter() - t2:.1f}s, total {time.perf_counter() - t0:.1f}s")
 
-# DATA LOADING
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
@@ -670,8 +673,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-# TRANSFORMER MODULES
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
