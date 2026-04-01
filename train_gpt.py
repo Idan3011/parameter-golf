@@ -437,7 +437,7 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else 6
+        bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else int(os.environ.get("ATTN_QUANT_BITS", "6"))
         q, s = quantize_float_tensor_int6(t, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -597,7 +597,7 @@ def apply_gptq_inplace(model: nn.Module, device: torch.device, args, log_fn=prin
             H = hessians.get(pname)
             if H is None:
                 continue
-            bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else 6
+            bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else int(os.environ.get("ATTN_QUANT_BITS", "6"))
             cr = (1 << (bits - 1)) - 1
             sp = float(os.environ.get("GPTQ_SPARSITY", "0.0"))
             with torch.no_grad():
