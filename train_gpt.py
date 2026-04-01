@@ -1211,8 +1211,8 @@ def main() -> None:
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
-        if bool(int(os.environ.get("USE_PROGRESSIVE", "0"))):
-            warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", "0.15"))
+        warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", "0"))
+        if warmdown_frac > 0:
             return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
