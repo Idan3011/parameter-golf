@@ -790,14 +790,11 @@ class CausalSelfAttention(nn.Module):
         if _VALUE_RESIDUAL:
             self.vr_lambda = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
 
-    def forward(self, x: Tensor, v0: Tensor | None = None, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, v0: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v_raw = self.c_v(x)
-        if v_embed is not None:
-            v_raw = v_raw + v_embed
-        v = v_raw.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         if _VALUE_RESIDUAL and v0 is not None:
             lam = torch.sigmoid(self.vr_lambda).to(dtype=v.dtype)
             v = lam[0] * v0 + lam[1] * v
@@ -844,11 +841,11 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self._ln_scale = 1.0 / math.sqrt(layer_idx + 1) if _LN_SCALE else 1.0
 
-    def forward(self, x: Tensor, x0: Tensor, v0: Tensor | None = None, v_embed: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, x0: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self._ln_scale
-        attn_out, v = self.attn(self.attn_norm(x), v0 if _VALUE_RESIDUAL else None, v_embed=v_embed)
+        attn_out, v = self.attn(self.attn_norm(x), v0 if _VALUE_RESIDUAL else None)
         x = x + s * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + s * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x, v
@@ -933,19 +930,15 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        ve_dim = int(os.environ.get("VE_DIM", "0"))
-        self._ve_layers = [int(x) for x in os.environ.get("VE_LAYERS", "").split(",") if x.strip()] if ve_dim > 0 else []
-        if self._ve_layers:
-            kv_dim = num_kv_heads * (model_dim // num_heads)
-            self.ve_embed = nn.Embedding(vocab_size, ve_dim)
-            nn.init.normal_(self.ve_embed.weight, std=0.01)
-            self.ve_proj = CastedLinear(ve_dim, kv_dim, bias=False)
-            nn.init.zeros_(self.ve_proj.weight)
-            self.ve_scales = nn.ParameterList([nn.Parameter(torch.tensor(0.1, dtype=torch.float32)) for _ in self._ve_layers])
-        mtp_n = int(os.environ.get("MTP_HEADS", "0"))
-        self.mtp_weight = float(os.environ.get("MTP_WEIGHT", "0.2"))
-        self.mtp_heads = nn.ModuleList([CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_n)])
-        for h in self.mtp_heads: h._zero_init = True
+        pred_hidden = int(os.environ.get("PRED_HEAD_DIM", "0"))
+        if pred_hidden > 0:
+            self.pred_head = nn.Sequential(
+                CastedLinear(model_dim, pred_hidden, bias=False),
+                nn.GELU(),
+                CastedLinear(pred_hidden, model_dim, bias=False),
+            )
+        else:
+            self.pred_head = None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -963,17 +956,11 @@ class GPT(nn.Module):
         self._active_enc = total_layers // 2
         self._active_dec = total_layers - self._active_enc
 
-    def _get_ve(self, idx, ids, cache):
-        if not self._ve_layers or idx not in self._ve_layers: return None
-        if 've' not in cache: cache['ve'] = self.ve_proj(self.ve_embed(ids))
-        return cache['ve'] * self.ve_scales[self._ve_layers.index(idx)].to(dtype=cache['ve'].dtype)
-    def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None) -> Tensor:
+    def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
         v0 = None
         enc_outputs: dict[int, Tensor] = {}
-        ve_cache: dict = {}
         for i in range(self._active_enc):
-            ve = self._get_ve(i, input_ids, ve_cache) if input_ids is not None else None
-            x, v = self.blocks[i](x, x0, v0, v_embed=ve)
+            x, v = self.blocks[i](x, x0, v0)
             if v0 is None: v0 = v
             enc_outputs[i] = x
         for i in range(self._active_dec):
@@ -982,16 +969,15 @@ class GPT(nn.Module):
             matching_enc = self.num_encoder_layers - 1 - dec_step
             if matching_enc >= 0 and matching_enc < self._active_enc and dec_step < self.num_skip_weights:
                 x = x + self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * enc_outputs[matching_enc]
-            ve = self._get_ve(dec_idx, input_ids, ve_cache) if input_ids is not None else None
-            x, v = self.blocks[dec_idx](x, x0, v0, v_embed=ve)
+            x, v = self.blocks[dec_idx](x, x0, v0)
         return x
 
     def _compute_logits(self, x: Tensor) -> Tensor:
+        if self.pred_head is not None:
+            x = x + self.pred_head(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
@@ -1000,31 +986,17 @@ class GPT(nn.Module):
         x = self.smear_gate(x)
         x = self.pre_enrich(x)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        x = self._run_blocks(x, x0, input_ids)
-        x_final = self.final_norm(x)
-        logits = self._compute_logits(x_final.reshape(-1, x_final.size(-1)))
-        loss = F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
-        if self.training and self.mtp_heads and self.mtp_weight > 0:
-            for k, head in enumerate(self.mtp_heads):
-                valid = x_final.size(1) - (k + 1)
-                if valid <= 0: continue
-                mtp_logits = head(x_final[:, :valid].reshape(-1, x_final.size(-1)))
-                loss = loss + self.mtp_weight * F.cross_entropy(mtp_logits.float(), target_ids[:, k+1:].reshape(-1), reduction="mean") / len(self.mtp_heads)
-        return loss
+        x = self._run_blocks(x, x)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        return F.cross_entropy(self._compute_logits(x).float(), target_ids.reshape(-1), reduction="mean")
 
-    def forward_logits(self, input_ids: Tensor, return_pe_delta: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
         x = self.smear_gate(x)
-        x_pre = x
         x = self.pre_enrich(x)
-        pe_delta = (x - x_pre).norm(dim=-1) if return_pe_delta else None
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        x = self._run_blocks(x, x0, input_ids)
-        x = self.final_norm(x)
-        logits = self._compute_logits(x)
-        return (logits, pe_delta) if return_pe_delta else logits
+        x = self._run_blocks(x, x)
+        return self._compute_logits(self.final_norm(x))
 
 # TRAINING
 
@@ -1150,6 +1122,8 @@ def main() -> None:
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     matrix_params.extend(p for p in base_model.pre_enrich.parameters() if p.ndim == 2)
+    if base_model.pred_head is not None:
+        matrix_params.extend(p for p in base_model.pred_head.parameters() if p.ndim == 2)
     matrix_params.extend(p for p in base_model.bigram_hash.parameters() if p.ndim == 2)
     scalar_params = [
         p
@@ -1435,7 +1409,7 @@ def main() -> None:
         del ema_state
         if bool(int(os.environ.get("USE_GPTQ", "0"))):
             apply_gptq_inplace(base_model, device, args, log_fn=log0)
-        export_sd = {k: v for k, v in base_model.state_dict().items() if "mtp_heads" not in k}
+        export_sd = base_model.state_dict()
         if master_process:
             torch.save(export_sd, "final_model.pt")
             sz = os.path.getsize("final_model.pt"); csz = len(code.encode("utf-8"))
@@ -1454,7 +1428,7 @@ def main() -> None:
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1481,7 +1455,7 @@ def main() -> None:
     )
     log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
     if bool(int(os.environ.get("USE_TTT", "0"))):
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         log0("ttt: starting")
