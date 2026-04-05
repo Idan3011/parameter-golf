@@ -13,3 +13,7 @@ logs/
 *.pyc
 *.log
 *.bin
+notebooks/
+*.so
+brotli.py
+brotli-*/
