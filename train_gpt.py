@@ -447,13 +447,19 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
         _quant_emb = bool(int(os.environ.get("QUANT_EMB", "0")))
+        _emb_bits = int(os.environ.get("EMB_QUANT_BITS", "8"))
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or ("tok_emb.weight" in name and not _quant_emb):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        bits = int(os.environ.get("MLP_QUANT_BITS", "5")) if 'mlp' in name else int(os.environ.get("ATTN_QUANT_BITS", "6"))
+        if "tok_emb.weight" in name:
+            bits = _emb_bits
+        elif 'mlp' in name:
+            bits = int(os.environ.get("MLP_QUANT_BITS", "5"))
+        else:
+            bits = int(os.environ.get("ATTN_QUANT_BITS", "6"))
         q, s = quantize_float_tensor_int6(t, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
