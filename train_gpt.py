@@ -277,7 +277,7 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                  base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, stride=64, log_fn=None):
     S, N = args.train_seq_len, val_tokens.numel()
     chunk_tok = int(os.environ.get("TTT_CHUNK_TOKENS", "131072"))
-    ttt_lr = float(os.environ.get("TTT_LR", "1e-4"))
+    ttt_lr = float(os.environ.get("TTT_LR", "0.002"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
     ema_d = float(os.environ.get("TTT_EMA_DECAY", "0.998"))
     freeze_n = int(os.environ.get("TTT_FREEZE_BLOCKS", "2"))
@@ -291,7 +291,11 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     for i in range(freeze_n, len(base_model.blocks)):
         for p in base_model.blocks[i].parameters(): p.requires_grad_(True)
     ttt_params = [p for p in base_model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.01)
+    _ttt_opt = os.environ.get("TTT_OPT", "sgd")
+    if _ttt_opt == "sgd":
+        opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
+    else:
+        opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
     ema = {n: p.data.clone() for n, p in base_model.named_parameters() if p.requires_grad}
     n_chunks = (N - S - 1 + chunk_tok - 1) // chunk_tok
     for ci, cs in enumerate(range(0, N - S - 1, chunk_tok)):
