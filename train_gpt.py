@@ -895,8 +895,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram_hash = BigramHash(2048, 128, model_dim)
-        self.smear_gate = SmearGate(model_dim)
+        self.bigram_hash = BigramHash(2048, 128, model_dim) if bool(int(os.environ.get("USE_BIGRAM", "1"))) else None
+        self.smear_gate = SmearGate(model_dim) if bool(int(os.environ.get("USE_SMEAR", "1"))) else None
         if bool(int(os.environ.get("USE_PRE_ENRICH", "1"))):
             pre_enrich_hidden = model_dim * 3 // 2
             self.pre_enrich = nn.Sequential(
@@ -982,8 +982,9 @@ class GPT(nn.Module):
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
-        x = self.smear_gate(x)
+        x = self.tok_emb(input_ids)
+        if self.bigram_hash is not None: x = x + self.bigram_hash(input_ids)
+        if self.smear_gate is not None: x = self.smear_gate(x)
         x = self.pre_enrich(x)
         x = F.rms_norm(x, (x.size(-1),))
         x = self._run_blocks(x, x)
@@ -991,8 +992,9 @@ class GPT(nn.Module):
         return F.cross_entropy(self._compute_logits(x).float(), target_ids.reshape(-1), reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids) + self.bigram_hash(input_ids)
-        x = self.smear_gate(x)
+        x = self.tok_emb(input_ids)
+        if self.bigram_hash is not None: x = x + self.bigram_hash(input_ids)
+        if self.smear_gate is not None: x = self.smear_gate(x)
         x = self.pre_enrich(x)
         x = F.rms_norm(x, (x.size(-1),))
         x = self._run_blocks(x, x)
@@ -1124,7 +1126,8 @@ def main() -> None:
     matrix_params.extend(p for p in base_model.pre_enrich.parameters() if p.ndim == 2)
     if base_model.pred_head is not None:
         matrix_params.extend(p for p in base_model.pred_head.parameters() if p.ndim == 2)
-    matrix_params.extend(p for p in base_model.bigram_hash.parameters() if p.ndim == 2)
+    if base_model.bigram_hash is not None:
+        matrix_params.extend(p for p in base_model.bigram_hash.parameters() if p.ndim == 2)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1132,7 +1135,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.smear_gate.gate)
+    if base_model.smear_gate is not None:
+        scalar_params.append(base_model.smear_gate.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
