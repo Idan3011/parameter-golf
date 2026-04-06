@@ -1476,8 +1476,8 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
     )
     log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
-    if bool(int(os.environ.get("USE_TTT", "0"))):
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if bool(int(os.environ.get("USE_TTT", "0"))) and rank == 0:
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         log0("ttt: starting")
