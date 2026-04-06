@@ -446,7 +446,8 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or "tok_emb.weight" in name:
+        _quant_emb = bool(int(os.environ.get("QUANT_EMB", "0")))
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or ("tok_emb.weight" in name and not _quant_emb):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
