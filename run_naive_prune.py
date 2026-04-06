@@ -68,9 +68,8 @@ for sp in [0.0, 0.15, 0.20, 0.25, 0.28, 0.30]:
             f.write(blob)
         print(f"    Saved final_model_sparse{int(sp*100)}.int6.ptz")
         if torch.cuda.is_available():
-            from train_gpt import (GPT, Hyperparameters, dequantize_state_dict_int8,
-                                   build_sentencepiece_luts, eval_val, load_validation_tokens)
-            from train_gpt import _byte_unshuffle, _decompress
+            from train_gpt import (GPT, Hyperparameters,
+                                   build_sentencepiece_luts, eval_val, load_validation_tokens, _decompress)
             import sentencepiece as spm
             args = Hyperparameters()
             device = torch.device("cuda")
@@ -81,10 +80,19 @@ for sp in [0.0, 0.15, 0.20, 0.25, 0.28, 0.30]:
                 logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             ).to(device).bfloat16()
             qs = torch.load(io.BytesIO(_decompress(blob)), map_location="cpu")
-            base_model.load_state_dict(dequantize_state_dict_int8(qs), strict=False)
-            sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+            deq = {}
+            for name, q in qs["quantized"].items():
+                s = qs["scales"][name]
+                if s.ndim > 0:
+                    deq[name] = (q.float() * s.float()[:, None]).to(torch.bfloat16)
+                else:
+                    deq[name] = (q.float() * s.float()).to(torch.bfloat16)
+            for name, t in qs["passthrough"].items():
+                deq[name] = t
+            base_model.load_state_dict(deq, strict=False)
+            sp_tok = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
             vt = load_validation_tokens(args.val_files, args.train_seq_len)
-            bl, hl, il = build_sentencepiece_luts(sp, args.vocab_size, device)
+            bl, hl, il = build_sentencepiece_luts(sp_tok, args.vocab_size, device)
             vl, vb = eval_val(args, base_model, 0, 1, device, 1, vt, bl, hl, il)
             print(f"    Post-quant val_bpb:{vb:.4f}")
             del base_model; torch.cuda.empty_cache()
