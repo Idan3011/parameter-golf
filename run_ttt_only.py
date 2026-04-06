@@ -8,8 +8,13 @@ except ImportError:
     pass
 from train_gpt import (Hyperparameters, GPT, CastedLinear, eval_val_ttt, eval_val,
                         build_sentencepiece_luts, load_validation_tokens, _decompress,
-                        dequantize_state_dict_int8)
+                        dequantize_state_dict_int8, restore_low_dim_params_to_fp32)
 import sentencepiece as spm
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+enable_cudnn_sdp(True); enable_flash_sdp(True); enable_mem_efficient_sdp(False); enable_math_sdp(False)
 
 distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
 if distributed:
@@ -35,6 +40,7 @@ base_model = GPT(
 ).to(device).bfloat16()
 for m in base_model.modules():
     if isinstance(m, CastedLinear): m.float()
+restore_low_dim_params_to_fp32(base_model)
 
 ptz = sys.argv[1] if len(sys.argv) > 1 else "final_model.int6.ptz"
 if rank == 0: print(f"Loading {ptz} ({os.path.getsize(ptz)} bytes)...")
@@ -54,6 +60,7 @@ if rank == 0:
 
 deq = dequantize_state_dict_int8(qs)
 base_model.load_state_dict(deq, strict=False)
+restore_low_dim_params_to_fp32(base_model)
 if rank == 0: print(f"Model loaded ({world_size} GPUs).")
 
 sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -70,6 +77,7 @@ ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
 if ttt_epochs > 0:
     deq2 = dequantize_state_dict_int8(qs)
     base_model.load_state_dict(deq2, strict=False)
+    restore_low_dim_params_to_fp32(base_model)
     if rank == 0: print(f"Model reloaded for TTT ({ttt_epochs} epochs)...")
     log_fn = print if rank == 0 else None
     t0 = time.perf_counter()
