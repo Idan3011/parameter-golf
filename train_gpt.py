@@ -23,9 +23,20 @@ try:
     _COMPRESSOR = "brotli"
 except ImportError:
     _COMPRESSOR = "lzma"
+import numpy as _np
+def _byte_shuffle(data: bytes) -> bytes:
+    arr = _np.frombuffer(data, dtype=_np.uint8)
+    pad = (4 - len(arr) % 4) % 4
+    if pad: arr = _np.concatenate([arr, _np.zeros(pad, dtype=_np.uint8)])
+    return bytes(arr.reshape(-1, 4).T.ravel())
+def _byte_unshuffle(data: bytes) -> bytes:
+    arr = _np.frombuffer(data, dtype=_np.uint8)
+    rows = len(arr) // 4
+    return bytes(arr.reshape(4, rows).T.ravel())
 def _decompress(data: bytes) -> bytes:
     try:
-        return brotli.decompress(data)
+        raw = brotli.decompress(data)
+        return _byte_unshuffle(raw)
     except Exception:
         return lzma.decompress(data)
 
@@ -1420,7 +1431,7 @@ def main() -> None:
             log0(f"Serialized model: {sz} bytes  Code: {csz}  Total: {sz + csz}")
         quant_obj, quant_stats = quantize_state_dict_int6(export_sd)
         quant_buf = io.BytesIO(); torch.save(quant_obj, quant_buf); quant_raw = quant_buf.getvalue()
-        quant_blob = brotli.compress(quant_raw, quality=11) if _COMPRESSOR == "brotli" else lzma.compress(quant_raw, preset=9)
+        quant_blob = brotli.compress(_byte_shuffle(quant_raw), quality=11) if _COMPRESSOR == "brotli" else lzma.compress(quant_raw, preset=9)
         if master_process:
             with open("final_model.int6.ptz", "wb") as f: f.write(quant_blob)
             qsz = os.path.getsize("final_model.int6.ptz"); csz = len(code.encode("utf-8"))
