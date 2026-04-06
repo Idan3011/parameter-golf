@@ -275,15 +275,28 @@ def eval_val(
 
 def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                  base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, stride=64, log_fn=None):
-    S, N = args.train_seq_len, val_tokens.numel()
+    S = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
     chunk_tok = int(os.environ.get("TTT_CHUNK_TOKENS", "131072"))
     ttt_lr = float(os.environ.get("TTT_LR", "0.002"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
-    ema_d = float(os.environ.get("TTT_EMA_DECAY", "0.998"))
     freeze_n = int(os.environ.get("TTT_FREEZE_BLOCKS", "2"))
     score_bs = int(os.environ.get("TTT_SCORE_BATCH", "64"))
     train_bs = int(os.environ.get("TTT_TRAIN_BATCH", "32"))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", "1.0"))
     distributed = dist.is_available() and dist.is_initialized()
+    num_chunks = max(1, (total_tokens + chunk_tok - 1) // chunk_tok)
+    all_windows: list[list[tuple[int, int]]] = [[] for _ in range(num_chunks)]
+    ws = 0
+    while ws < total_tokens:
+        wlen = min(S, total_tokens - ws)
+        if wlen < stride and ws > 0:
+            break
+        ss = 0 if ws == 0 else max(wlen - stride, 0)
+        scored_start = ws + ss
+        ci = min(scored_start // chunk_tok, num_chunks - 1)
+        all_windows[ci].append((ws, ss))
+        ws += stride
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
@@ -296,35 +309,36 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
     else:
         opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
-    ema = {n: p.data.clone() for n, p in base_model.named_parameters() if p.requires_grad}
-    n_chunks = (N - S - 1 + chunk_tok - 1) // chunk_tok
-    for ci, cs in enumerate(range(0, N - S - 1, chunk_tok)):
-        chunk = val_tokens[cs:min(cs + chunk_tok + S, N - 1) + 1]
-        windows = []
-        pos = 0
-        while pos + S < chunk.numel() - 1:
-            windows.append((pos, 0 if pos == 0 else S - stride))
-            pos += stride
+    for ci in range(num_chunks):
+        windows = all_windows[ci]
+        if not windows:
+            continue
         my_windows = windows[rank::world_size] if distributed else windows
         base_model.eval()
         with torch.no_grad():
             for bi in range(0, len(my_windows), score_bs):
                 bw = my_windows[bi:bi + score_bs]
-                x = torch.stack([chunk[p:p+S] for p, _ in bw]).to(device=device, dtype=torch.int64)
-                y = torch.stack([chunk[p+1:p+S+1] for p, _ in bw]).to(device=device, dtype=torch.int64)
+                wlens = [min(S, total_tokens - ws) for ws, _ in bw]
+                x = torch.stack([val_tokens[ws:ws+wl] for (ws, _), wl in zip(bw, wlens)]).to(device=device, dtype=torch.int64)
+                y = torch.stack([val_tokens[ws+1:ws+wl+1] for (ws, _), wl in zip(bw, wlens)]).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x)
-                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), S)
-                for j, (_, ss) in enumerate(bw):
-                    sl = ptl[j, ss:]; L += sl.to(torch.float64).sum(); T += float(sl.numel())
-                    sp, st = x[j, ss:], y[j, ss:]
+                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), -1)
+                for j, ((_, ss), wl) in enumerate(zip(bw, wlens)):
+                    sl = ptl[j, ss:wl]; L += sl.to(torch.float64).sum(); T += float(sl.numel())
+                    sp, st = x[j, ss:wl], y[j, ss:wl]
                     B += (base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)).to(torch.float64).sum()
-        if ci < n_chunks - 1:
+        if ci < num_chunks - 1 and ttt_epochs > 0:
+            chunk_start = ci * chunk_tok
+            chunk_end = min((ci + 1) * chunk_tok + S, total_tokens)
+            chunk = val_tokens[chunk_start:chunk_end + 1]
+            cos_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+            for pg in opt.param_groups: pg['lr'] = cos_lr
             base_model.train()
             for _ in range(ttt_epochs):
                 seqs = []
                 pos = 0
-                while pos + S < chunk.numel() - 1:
+                while pos + S < chunk.numel():
                     seqs.append(pos)
                     pos += S
                 my_seqs = seqs[rank::world_size] if distributed else seqs
@@ -332,17 +346,16 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                     batch_pos = my_seqs[si:si + train_bs]
                     xb = torch.stack([chunk[p:p+S] for p in batch_pos]).to(device=device, dtype=torch.int64)
                     yb = torch.stack([chunk[p+1:p+S+1] for p in batch_pos]).to(device=device, dtype=torch.int64)
+                    opt.zero_grad(set_to_none=True)
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         F.cross_entropy(base_model.forward_logits(xb).float().reshape(-1, args.vocab_size), yb.reshape(-1)).backward()
                     if distributed:
                         for p in ttt_params:
                             if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                    opt.step(); opt.zero_grad()
-            with torch.no_grad():
-                for n, p in base_model.named_parameters():
-                    if n in ema: ema[n].mul_(ema_d).add_(p.data, alpha=1-ema_d); p.data.copy_(ema[n])
-        if log_fn and ci % 10 == 0: log_fn(f"ttt: chunk={ci}/{n_chunks}")
-    if dist.is_available() and dist.is_initialized():
+                    torch.nn.utils.clip_grad_norm_(ttt_params, ttt_grad_clip)
+                    opt.step()
+        if log_fn and ci % 10 == 0: log_fn(f"ttt: chunk={ci}/{num_chunks}")
+    if distributed:
         for t in (L, T, B): dist.all_reduce(t, op=dist.ReduceOp.SUM)
     for p in base_model.parameters(): p.requires_grad_(True)
     return float((L / (B * math.log(2.0))).item())
