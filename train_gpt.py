@@ -283,13 +283,15 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     freeze_n = int(os.environ.get("TTT_FREEZE_BLOCKS", "2"))
     score_bs = int(os.environ.get("TTT_SCORE_BATCH", "64"))
     train_bs = int(os.environ.get("TTT_TRAIN_BATCH", "32"))
+    distributed = dist.is_available() and dist.is_initialized()
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
     for p in base_model.parameters(): p.requires_grad_(False)
     for i in range(freeze_n, len(base_model.blocks)):
         for p in base_model.blocks[i].parameters(): p.requires_grad_(True)
-    opt = torch.optim.AdamW([p for p in base_model.parameters() if p.requires_grad], lr=ttt_lr, weight_decay=0.01)
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.01)
     ema = {n: p.data.clone() for n, p in base_model.named_parameters() if p.requires_grad}
     n_chunks = (N - S - 1 + chunk_tok - 1) // chunk_tok
     for ci, cs in enumerate(range(0, N - S - 1, chunk_tok)):
@@ -299,10 +301,11 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         while pos + S < chunk.numel() - 1:
             windows.append((pos, 0 if pos == 0 else S - stride))
             pos += stride
+        my_windows = windows[rank::world_size] if distributed else windows
         base_model.eval()
         with torch.no_grad():
-            for bi in range(0, len(windows), score_bs):
-                bw = windows[bi:bi + score_bs]
+            for bi in range(0, len(my_windows), score_bs):
+                bw = my_windows[bi:bi + score_bs]
                 x = torch.stack([chunk[p:p+S] for p, _ in bw]).to(device=device, dtype=torch.int64)
                 y = torch.stack([chunk[p+1:p+S+1] for p, _ in bw]).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -315,15 +318,22 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         if ci < n_chunks - 1:
             base_model.train()
             for _ in range(ttt_epochs):
+                seqs = []
                 pos = 0
                 while pos + S < chunk.numel() - 1:
-                    end = min(pos + train_bs * S, chunk.numel() - 1)
-                    n_seq = (end - pos) // S
-                    xb = chunk[pos:pos + n_seq * S].reshape(n_seq, S).to(device=device, dtype=torch.int64)
-                    yb = chunk[pos + 1:pos + n_seq * S + 1].reshape(n_seq, S).to(device=device, dtype=torch.int64)
+                    seqs.append(pos)
+                    pos += S
+                my_seqs = seqs[rank::world_size] if distributed else seqs
+                for si in range(0, len(my_seqs), train_bs):
+                    batch_pos = my_seqs[si:si + train_bs]
+                    xb = torch.stack([chunk[p:p+S] for p in batch_pos]).to(device=device, dtype=torch.int64)
+                    yb = torch.stack([chunk[p+1:p+S+1] for p in batch_pos]).to(device=device, dtype=torch.int64)
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         F.cross_entropy(base_model.forward_logits(xb).float().reshape(-1, args.vocab_size), yb.reshape(-1)).backward()
-                    opt.step(); opt.zero_grad(); pos += n_seq * S
+                    if distributed:
+                        for p in ttt_params:
+                            if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    opt.step(); opt.zero_grad()
             with torch.no_grad():
                 for n, p in base_model.named_parameters():
                     if n in ema: ema[n].mul_(ema_d).add_(p.data, alpha=1-ema_d); p.data.copy_(ema[n])

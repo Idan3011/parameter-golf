@@ -1,5 +1,6 @@
 """TTT eval only — no sliding, no post-quant eval. Fastest possible."""
 import os, sys, io, time, torch, math, lzma
+import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(__file__))
 try:
     import brotli
@@ -9,8 +10,18 @@ from train_gpt import (Hyperparameters, GPT, CastedLinear, eval_val_ttt,
                         build_sentencepiece_luts, load_validation_tokens, _decompress)
 import sentencepiece as spm
 
+distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+if distributed:
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+else:
+    rank, world_size = 0, 1
+    device = torch.device("cuda")
+
 args = Hyperparameters()
-device = torch.device("cuda")
 
 base_model = GPT(
     vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -22,7 +33,7 @@ for m in base_model.modules():
     if isinstance(m, CastedLinear): m.float()
 
 ptz = sys.argv[1] if len(sys.argv) > 1 else "final_model.int6.ptz"
-print(f"Loading {ptz}...")
+if rank == 0: print(f"Loading {ptz}...")
 with open(ptz, "rb") as f:
     blob = f.read()
 qs = torch.load(io.BytesIO(_decompress(blob)), map_location="cpu")
@@ -37,14 +48,17 @@ for name, t in qs["passthrough"].items():
     orig = qs.get("passthrough_orig_dtypes", {}).get(name)
     deq[name] = t.to(dtype=getattr(torch, orig)) if isinstance(orig, str) else t
 base_model.load_state_dict(deq, strict=False)
-print("Model loaded. Starting TTT...")
+if rank == 0: print(f"Model loaded ({world_size} GPUs). Starting TTT...")
 
 sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
 vt = load_validation_tokens(args.val_files, args.train_seq_len)
 bl, hl, il = build_sentencepiece_luts(sp, args.vocab_size, device)
 
+log_fn = print if rank == 0 else None
 t0 = time.perf_counter()
-ttt_bpb = eval_val_ttt(args, base_model, 0, 1, device, vt, bl, hl, il, log_fn=print)
+ttt_bpb = eval_val_ttt(args, base_model, rank, world_size, device, vt, bl, hl, il, log_fn=log_fn)
 elapsed = time.perf_counter() - t0
-print(f"final_ttt val_bpb:{ttt_bpb:.4f} eval_time:{elapsed*1000:.0f}ms")
-print(f"final_ttt_exact val_bpb:{ttt_bpb:.8f}")
+if rank == 0:
+    print(f"final_ttt val_bpb:{ttt_bpb:.4f} eval_time:{elapsed*1000:.0f}ms")
+    print(f"final_ttt_exact val_bpb:{ttt_bpb:.8f}")
+if distributed: dist.destroy_process_group()
