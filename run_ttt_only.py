@@ -59,9 +59,16 @@ if rank == 0:
     if extra: print(f"  EXTRA in ptz (not in model): {extra}")
 
 deq = dequantize_state_dict_int8(qs)
-base_model.load_state_dict(deq, strict=False)
+result = base_model.load_state_dict(deq, strict=False)
+if rank == 0:
+    if result.missing_keys: print(f"  !!! MISSING keys: {result.missing_keys}")
+    if result.unexpected_keys: print(f"  !!! UNEXPECTED keys: {result.unexpected_keys}")
 restore_low_dim_params_to_fp32(base_model)
-if rank == 0: print(f"Model loaded ({world_size} GPUs).")
+if rank == 0:
+    for n in ["tok_emb.weight", "blocks.0.mlp.fc.weight", "blocks.9.mlp.proj.weight", "skip_weights"]:
+        p = dict(base_model.named_parameters())[n]
+        print(f"  {n}: dtype={p.dtype} mean={p.float().mean():.6f} std={p.float().std():.6f} min={p.float().min():.4f} max={p.float().max():.4f}")
+    print(f"Model loaded ({world_size} GPUs).")
 
 sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
 vt = load_validation_tokens(args.val_files, args.train_seq_len)
