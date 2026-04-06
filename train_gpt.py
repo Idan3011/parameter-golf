@@ -76,7 +76,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2 if _RUN_CONFIG == "C" else 3))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2 if _RUN_CONFIG == "C" else 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -825,9 +825,9 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y), v
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, leaky: bool = False):
+    def __init__(self, dim: int, mlp_mult: float, leaky: bool = False):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = int(mlp_mult * dim)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -926,8 +926,8 @@ class GPT(nn.Module):
         self._active_dec = _prog_init - self._active_enc
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
-        mlp_mult_enc = int(os.environ.get("MLP_MULT_ENCODER", mlp_mult))
-        mlp_mult_dec = int(os.environ.get("MLP_MULT_DECODER", mlp_mult))
+        mlp_mult_enc = float(os.environ.get("MLP_MULT_ENCODER", mlp_mult))
+        mlp_mult_dec = float(os.environ.get("MLP_MULT_DECODER", mlp_mult))
         leaky = bool(int(os.environ.get("LEAKY_RELU", "0")))
         self.blocks = nn.ModuleList(
             [
