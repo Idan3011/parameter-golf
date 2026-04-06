@@ -300,7 +300,7 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
             windows.append((pos, 0 if pos == 0 else S - stride))
             pos += stride
         base_model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             for bi in range(0, len(windows), score_bs):
                 bw = windows[bi:bi + score_bs]
                 x = torch.stack([chunk[p:p+S] for p, _ in bw]).to(device=device, dtype=torch.int64)
@@ -1476,7 +1476,7 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
     )
     log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
-    if bool(int(os.environ.get("USE_TTT", "0"))) and rank == 0:
+    if bool(int(os.environ.get("USE_TTT", "0"))):
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
