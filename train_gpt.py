@@ -1460,32 +1460,34 @@ def main() -> None:
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args, model, rank, world_size, device, grad_accum_steps,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    _ttt_only = bool(int(os.environ.get("TTT_ONLY", "0")))
+    if not _ttt_only:
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    torch.cuda.synchronize()
-    t_slide = time.perf_counter()
-    sw_val_loss, sw_val_bpb = eval_val_sliding(
-        args, base_model, rank, world_size, device,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_sliding_window val_bpb:{sw_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
-    )
-    log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_sliding_window val_bpb:{sw_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+        )
+        log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
     if bool(int(os.environ.get("USE_TTT", "0"))):
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
         torch.cuda.synchronize()
