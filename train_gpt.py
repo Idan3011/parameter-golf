@@ -299,6 +299,8 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
     else:
         opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
+    _, sanity_bpb = eval_val_sliding(args, base_model, rank, world_size, device, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+    if log_fn: log_fn(f"ttt: sanity sliding_bpb={sanity_bpb:.4f}")
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows:
