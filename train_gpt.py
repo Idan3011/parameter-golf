@@ -304,7 +304,7 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
         base_model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             for bi in range(0, len(my_windows), score_bs):
                 bw = my_windows[bi:bi + score_bs]
                 x = torch.stack([val_tokens[w:w+S] for w, _ in bw]).to(device=device, dtype=torch.int64)
