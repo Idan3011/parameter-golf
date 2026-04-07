@@ -903,7 +903,7 @@ def _ensure_sp4096_data() -> None:
     from huggingface_hub import hf_hub_download, list_repo_tree
     import shutil
     REPO = "idan3011/parameter-golf-sp4096"
-    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 0))
+    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 80))
     os.makedirs("data/tokenizers", exist_ok=True)
     os.makedirs("data/datasets/fineweb10B_sp4096", exist_ok=True)
     train_count = 0
