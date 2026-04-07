@@ -290,17 +290,8 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
-    for p in base_model.parameters(): p.requires_grad_(False)
-    for i in range(freeze_n, len(base_model.blocks)):
-        for p in base_model.blocks[i].parameters(): p.requires_grad_(True)
-    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
-    _ttt_opt = os.environ.get("TTT_OPT", "sgd")
-    if _ttt_opt == "sgd":
-        opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
-    else:
-        opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
-    _, sanity_bpb = eval_val_sliding(args, base_model, rank, world_size, device, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-    if log_fn: log_fn(f"ttt: sanity sliding_bpb={sanity_bpb:.4f}")
+    ttt_params = None
+    opt = None
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows:
@@ -323,6 +314,16 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
             for block in base_model.blocks:
                 block.attn.rotary._cos_cached = None
                 block.attn.rotary._sin_cached = None
+            if ttt_params is None:
+                for p in base_model.parameters(): p.requires_grad_(False)
+                for i in range(freeze_n, len(base_model.blocks)):
+                    for p in base_model.blocks[i].parameters(): p.requires_grad_(True)
+                ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+                _ttt_opt = os.environ.get("TTT_OPT", "sgd")
+                if _ttt_opt == "sgd":
+                    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
+                else:
+                    opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
             chunk_start = ci * chunk_tok
             chunk_end = min((ci + 1) * chunk_tok + S, total_tokens)
             chunk = val_tokens[chunk_start:chunk_end + 1]
