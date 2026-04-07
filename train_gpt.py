@@ -282,17 +282,9 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
-    _pl = bool(int(os.environ.get("TTT_PER_LAYER_LR", "0")))
     _fr = lambda n: any(f"blocks.{bi}." in n for bi in range(min(freeze_n, len(base_model.blocks))))
-    if _pl:
-        pp = [p for n, p in base_model.named_parameters() if not _fr(n) and 'mlp.proj' in n]
-        fp = [p for n, p in base_model.named_parameters() if not _fr(n) and 'mlp.fc' in n]
-        op = [p for n, p in base_model.named_parameters() if not _fr(n) and 'mlp' not in n]
-        ttt_params = pp + fp + op
-        opt = torch.optim.AdamW([{'params': pp, 'lr': ttt_lr*3}, {'params': fp, 'lr': ttt_lr*0.5}, {'params': op, 'lr': ttt_lr}], weight_decay=0.0)
-    else:
-        ttt_params = [p for n, p in base_model.named_parameters() if not _fr(n)]
-        opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
+    ttt_params = [p for n, p in base_model.named_parameters() if not _fr(n)]
+    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
