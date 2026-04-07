@@ -48,7 +48,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# HYPERPARAMETERS
 _RUN_CONFIG = os.environ.get("RUN_CONFIG", "A")
 
 class Hyperparameters:
@@ -100,7 +99,6 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     leaky_relu = bool(int(os.environ.get("LEAKY_RELU", "0")))
     crownq_lambda = float(os.environ.get("CROWNQ_LAMBDA", 0.01))
-
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -270,7 +268,7 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                  base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, stride=64, log_fn=None):
     S = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
-    chunk_tok = int(os.environ.get("TTT_CHUNK_TOKENS", "131072"))
+    chunk_tok = int(os.environ.get("TTT_CHUNK_TOKENS", "32768"))
     ttt_lr = float(os.environ.get("TTT_LR", "0.002"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
     freeze_n = int(os.environ.get("TTT_FREEZE_BLOCKS", "2"))
@@ -283,32 +281,34 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     ws = 0
     while ws + S <= total_tokens:
         ss = 0 if ws == 0 else S - stride
-        scored_start = ws + ss
-        ci = min(scored_start // chunk_tok, num_chunks - 1)
+        ci = min((ws + ss) // chunk_tok, num_chunks - 1)
         all_windows[ci].append((ws, ss))
         ws += stride
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
+    frozen_ids = set(range(min(freeze_n, len(base_model.blocks))))
     ttt_params = []
-    for i in range(freeze_n, len(base_model.blocks)):
-        ttt_params.extend(base_model.blocks[i].parameters())
-    _ttt_opt = os.environ.get("TTT_OPT", "sgd")
-    if _ttt_opt == "sgd":
-        opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
-    else:
-        opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
+    for name, p in base_model.named_parameters():
+        freeze = any(f"blocks.{bi}." in name for bi in frozen_ids)
+        if freeze:
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(True)
+            ttt_params.append(p)
+    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
     for ci in range(num_chunks):
         windows = all_windows[ci]
-        if not windows:
-            continue
-        my_windows = windows[rank::world_size] if distributed else windows
+        if not windows: continue
+        my_s = (len(windows) * rank) // world_size
+        my_e = (len(windows) * (rank + 1)) // world_size
+        my_windows = windows[my_s:my_e]
         base_model.eval()
         with torch.inference_mode():
             for bi in range(0, len(my_windows), score_bs):
                 bw = my_windows[bi:bi + score_bs]
-                x = torch.stack([val_tokens[ws:ws+S] for ws, _ in bw]).to(device=device, dtype=torch.int64)
-                y = torch.stack([val_tokens[ws+1:ws+S+1] for ws, _ in bw]).to(device=device, dtype=torch.int64)
+                x = torch.stack([val_tokens[w:w+S] for w, _ in bw]).to(device=device, dtype=torch.int64)
+                y = torch.stack([val_tokens[w+1:w+S+1] for w, _ in bw]).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x)
                 ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), S)
@@ -317,37 +317,38 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                     sp, st = x[j, ss:], y[j, ss:]
                     B += (base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)).to(torch.float64).sum()
         if ci < num_chunks - 1 and ttt_epochs > 0:
-            for block in base_model.blocks:
-                block.attn.rotary._cos_cached = None
-                block.attn.rotary._sin_cached = None
             chunk_start = ci * chunk_tok
-            chunk_end = min((ci + 1) * chunk_tok + S, total_tokens)
-            chunk = val_tokens[chunk_start:chunk_end + 1]
-            cos_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-            for pg in opt.param_groups: pg['lr'] = cos_lr
-            base_model.train()
-            for _ in range(ttt_epochs):
-                seqs = []
-                pos = 0
-                while pos + S < chunk.numel():
-                    seqs.append(pos)
-                    pos += S
-                my_seqs = seqs[rank::world_size] if distributed else seqs
-                for si in range(0, len(my_seqs), train_bs):
-                    batch_pos = my_seqs[si:si + train_bs]
-                    xb = torch.stack([chunk[p:p+S] for p in batch_pos]).to(device=device, dtype=torch.int64)
-                    yb = torch.stack([chunk[p+1:p+S+1] for p in batch_pos]).to(device=device, dtype=torch.int64)
-                    opt.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        F.cross_entropy(base_model.forward_logits(xb).float().reshape(-1, args.vocab_size), yb.reshape(-1)).backward()
-                    if distributed:
-                        for p in ttt_params:
-                            if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                    torch.nn.utils.clip_grad_norm_(ttt_params, ttt_grad_clip)
-                    opt.step()
+            chunk_end = min((ci + 1) * chunk_tok, total_tokens)
+            chunk_seqs = (chunk_end - chunk_start) // S
+            if chunk_seqs > 0:
+                cos_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in opt.param_groups: pg['lr'] = cos_lr
+                my_seq_s = (chunk_seqs * rank) // world_size
+                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
+                base_model.train()
+                for _ in range(ttt_epochs):
+                    for bs in range(my_seq_s, my_seq_e, train_bs):
+                        be = min(bs + train_bs, my_seq_e)
+                        start_tok = chunk_start + bs * S
+                        end_tok = chunk_start + be * S + 1
+                        if end_tok > val_tokens.numel(): continue
+                        local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+                        x = local[:-1].reshape(-1, S)
+                        y = local[1:].reshape(-1, S)
+                        opt.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            loss = base_model(x, y)
+                        loss.backward()
+                        if distributed:
+                            for p in ttt_params:
+                                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        torch.nn.utils.clip_grad_norm_(ttt_params, ttt_grad_clip)
+                        opt.step()
         if log_fn and ci % 10 == 0: log_fn(f"ttt: chunk={ci}/{num_chunks}")
     if distributed:
         for t in (L, T, B): dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    for p in base_model.parameters(): p.requires_grad_(True)
+    base_model.eval()
     return float((L / (B * math.log(2.0))).item())
 
 def eval_val_sliding(
@@ -1027,8 +1028,6 @@ class GPT(nn.Module):
         x = self._run_blocks(x, x)
         return self._compute_logits(self.final_norm(x))
 
-# TRAINING
-
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -1038,8 +1037,6 @@ def main() -> None:
     _use_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
     if _use_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-
-    # DISTRIBUTED + CUDA SETUP
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1060,7 +1057,6 @@ def main() -> None:
         dist.barrier()
     master_process = rank == 0
 
-    # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -1102,8 +1098,6 @@ def main() -> None:
     )
     log0(f"data:{dataset_dir.name} train_shards:{actual_train_files} val_tokens:{val_tokens.numel()-1}")
 
-    # MODEL + OPTIMIZER SETUP
-
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1139,11 +1133,6 @@ def main() -> None:
     _prog = bool(int(os.environ.get("USE_PROGRESSIVE", "0")))
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_prog) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -1196,17 +1185,14 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum:{grad_accum_steps}")
     log0(f"batch:{args.train_batch_tokens} seq:{args.train_seq_len} warmup:{args.warmup_steps} wallclock:{args.max_wallclock_seconds:.0f}s")
-
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -1254,8 +1240,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-
-    # MAIN TRAINING LOOP
 
     training_time_ms = 0.0
     if not eval_only:
@@ -1413,7 +1397,6 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
-        # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
@@ -1488,18 +1471,28 @@ def main() -> None:
         )
         log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
     if bool(int(os.environ.get("USE_TTT", "0"))):
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
+        ttt_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        ).to(device).bfloat16()
+        for m in ttt_model.modules():
+            if isinstance(m, CastedLinear): m.float()
+        restore_low_dim_params_to_fp32(ttt_model)
+        ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
-        log0("ttt: starting")
+        log0("ttt: starting (fresh uncompiled model)")
         ttt_bpb = eval_val_ttt(
-            args, base_model, rank, world_size, device,
+            args, ttt_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             log_fn=log0,
         )
         torch.cuda.synchronize()
         log0(f"final_ttt val_bpb:{ttt_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
         log0(f"final_ttt_exact val_bpb:{ttt_bpb:.8f}")
+        del ttt_model
     if distributed:
         dist.destroy_process_group()
 
