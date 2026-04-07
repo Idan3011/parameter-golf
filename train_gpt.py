@@ -287,14 +287,10 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
-    frozen_ids = set(range(min(freeze_n, len(base_model.blocks))))
     ttt_params = []
     for name, p in base_model.named_parameters():
-        freeze = any(f"blocks.{bi}." in name for bi in frozen_ids)
-        if freeze:
-            p.requires_grad_(False)
-        else:
-            p.requires_grad_(True)
+        frozen = any(f"blocks.{bi}." in name for bi in range(min(freeze_n, len(base_model.blocks))))
+        if not frozen:
             ttt_params.append(p)
     opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
     for ci in range(num_chunks):
@@ -347,8 +343,6 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         if log_fn and ci % 10 == 0: log_fn(f"ttt: chunk={ci}/{num_chunks}")
     if distributed:
         for t in (L, T, B): dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    for p in base_model.parameters(): p.requires_grad_(True)
-    base_model.eval()
     return float((L / (B * math.log(2.0))).item())
 
 def eval_val_sliding(
@@ -1483,7 +1477,9 @@ def main() -> None:
         ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
-        log0("ttt: starting (fresh uncompiled model)")
+        if bool(int(os.environ.get("TORCH_COMPILE", "1"))):
+            ttt_model = torch.compile(ttt_model)
+        log0("ttt: starting (fresh compiled model)")
         ttt_bpb = eval_val_ttt(
             args, ttt_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
