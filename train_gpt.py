@@ -103,8 +103,6 @@ class Hyperparameters:
 
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -159,7 +157,6 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -205,7 +202,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
@@ -224,9 +220,6 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -288,11 +281,8 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     num_chunks = max(1, (total_tokens + chunk_tok - 1) // chunk_tok)
     all_windows: list[list[tuple[int, int]]] = [[] for _ in range(num_chunks)]
     ws = 0
-    while ws < total_tokens:
-        wlen = min(S, total_tokens - ws)
-        if wlen < stride and ws > 0:
-            break
-        ss = 0 if ws == 0 else max(wlen - stride, 0)
+    while ws + S <= total_tokens:
+        ss = 0 if ws == 0 else S - stride
         scored_start = ws + ss
         ci = min(scored_start // chunk_tok, num_chunks - 1)
         all_windows[ci].append((ws, ss))
@@ -318,15 +308,14 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         with torch.no_grad():
             for bi in range(0, len(my_windows), score_bs):
                 bw = my_windows[bi:bi + score_bs]
-                wlens = [min(S, total_tokens - ws) for ws, _ in bw]
-                x = torch.stack([val_tokens[ws:ws+wl] for (ws, _), wl in zip(bw, wlens)]).to(device=device, dtype=torch.int64)
-                y = torch.stack([val_tokens[ws+1:ws+wl+1] for (ws, _), wl in zip(bw, wlens)]).to(device=device, dtype=torch.int64)
+                x = torch.stack([val_tokens[ws:ws+S] for ws, _ in bw]).to(device=device, dtype=torch.int64)
+                y = torch.stack([val_tokens[ws+1:ws+S+1] for ws, _ in bw]).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x)
-                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), -1)
-                for j, ((_, ss), wl) in enumerate(zip(bw, wlens)):
-                    sl = ptl[j, ss:wl]; L += sl.to(torch.float64).sum(); T += float(sl.numel())
-                    sp, st = x[j, ss:wl], y[j, ss:wl]
+                ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), S)
+                for j, (_, ss) in enumerate(bw):
+                    sl = ptl[j, ss:]; L += sl.to(torch.float64).sum(); T += float(sl.numel())
+                    sp, st = x[j, ss:], y[j, ss:]
                     B += (base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)).to(torch.float64).sum()
         if ci < num_chunks - 1 and ttt_epochs > 0:
             chunk_start = ci * chunk_tok
@@ -516,13 +505,11 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -658,7 +645,6 @@ def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
-    # SHARD HEADER INTS & SHARD_MAGIC
     if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
@@ -671,8 +657,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -701,8 +685,6 @@ class TokenStream:
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -754,7 +736,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, w.to(x.dtype), bias)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
