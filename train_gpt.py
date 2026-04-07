@@ -305,7 +305,7 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
             continue
         my_windows = windows[rank::world_size] if distributed else windows
         base_model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             for bi in range(0, len(my_windows), score_bs):
                 bw = my_windows[bi:bi + score_bs]
                 x = torch.stack([val_tokens[ws:ws+S] for ws, _ in bw]).to(device=device, dtype=torch.int64)
@@ -318,6 +318,9 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                     sp, st = x[j, ss:], y[j, ss:]
                     B += (base_bytes_lut[st].to(torch.int16) + (has_leading_space_lut[st] & ~is_boundary_token_lut[sp]).to(torch.int16)).to(torch.float64).sum()
         if ci < num_chunks - 1 and ttt_epochs > 0:
+            for block in base_model.blocks:
+                block.attn.rotary._cos_cached = None
+                block.attn.rotary._sin_cached = None
             chunk_start = ci * chunk_tok
             chunk_end = min((ci + 1) * chunk_tok + S, total_tokens)
             chunk = val_tokens[chunk_start:chunk_end + 1]
