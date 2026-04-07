@@ -287,11 +287,9 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     L = torch.zeros((), device=device, dtype=torch.float64)
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
-    ttt_params = []
-    for name, p in base_model.named_parameters():
-        frozen = any(f"blocks.{bi}." in name for bi in range(min(freeze_n, len(base_model.blocks))))
-        if not frozen:
-            ttt_params.append(p)
+    _scale_only = bool(int(os.environ.get("TTT_SCALE_ONLY", "0")))
+    _pats = ("attn_scale", "mlp_scale", "resid_mix", "skip_weights", "q_gain")
+    ttt_params = [p for n, p in base_model.named_parameters() if (any(pat in n for pat in _pats) if _scale_only else not any(f"blocks.{bi}." in n for bi in range(min(freeze_n, len(base_model.blocks)))))]
     opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
     for ci in range(num_chunks):
         windows = all_windows[ci]
