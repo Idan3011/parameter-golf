@@ -304,7 +304,7 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                 x = torch.stack([val_tokens[w:w+S] for w, _ in bw]).to(device=device, dtype=torch.int64)
                 y = torch.stack([val_tokens[w+1:w+S+1] for w, _ in bw]).to(device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x)
+                    logits = base_model(x)
                 ptl = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").reshape(len(bw), S)
                 for j, (_, ss) in enumerate(bw):
                     sl = ptl[j, ss:]; L += sl.to(torch.float64).sum(); T += float(sl.numel())
@@ -1001,15 +1001,17 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram_hash is not None: x = x + self.bigram_hash(input_ids)
         if self.smear_gate is not None: x = self.smear_gate(x)
         x = self.pre_enrich(x)
         x = F.rms_norm(x, (x.size(-1),))
         x = self._run_blocks(x, x)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        return F.cross_entropy(self._compute_logits(x).float(), target_ids.reshape(-1), reduction="mean")
+        x = self.final_norm(x)
+        logits = self._compute_logits(x)
+        if target_ids is None: return logits
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
