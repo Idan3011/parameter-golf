@@ -51,7 +51,7 @@ class Hyperparameters:
     train_batch_tokens = 786_432
     train_seq_len = 2048
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = 4.0
+    qk_gain_init = 5.0  # was 4.0; PR #1413/#1421/#1394 evidence shows ~-0.003 BPB lift, zero byte cost
     vocab_size = 4096
     num_layers = 11
     num_kv_heads = 4
@@ -88,6 +88,10 @@ class Hyperparameters:
     ttt_score_batch = 64
     ttt_train_batch = 32
     ttt_grad_clip = 1.0
+    use_qat = bool(int(os.environ.get("USE_QAT", "1")))
+    late_qat_lr_threshold = 0.5  # smoke at 0.5 was the empirical optimum (better than 0.15 and 0.8)
+    qat_bits = 4
+    skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -496,6 +500,135 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         out[name] = out_t
     return out
 
+# --- QAT int4 path: matched train/export quantizer for the use_qat=True flow ---
+
+def quantize_float_tensor_int4_symmetric(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-row symmetric int4 absmax. Matches CastedLinear's QAT forward EXACTLY.
+    Returns (q in [-7..7] as int8, scale as fp16 per row)."""
+    qmax = 7
+    t32 = t.float()
+    if t32.ndim == 2:
+        scale = t32.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / qmax
+        q = torch.clamp(torch.round(t32 / scale), -qmax, qmax).to(torch.int8)
+        return q.contiguous(), scale.squeeze(1).to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    clip_abs = float(t32.abs().amax().item()) if t32.numel() else 0.0
+    scale_val = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(t32 / scale_val), -qmax, qmax).to(torch.int8).contiguous()
+    return q, scale_val.to(dtype=INT8_PER_ROW_SCALE_DTYPE)
+
+def pack_int4_signed(q: Tensor) -> Tensor:
+    """Pack signed int8 in [-7..7] into 4-bit unsigned bytes (offset by 7 → [0..14]).
+    Last dim must be even. Returns shape (..., last_dim/2)."""
+    assert q.dtype == torch.int8
+    assert q.shape[-1] % 2 == 0, f"need even last dim for 4-bit pack, got {q.shape}"
+    shifted = (q.to(torch.int16) + 7).to(torch.uint8) & 0x0F
+    high = shifted[..., 0::2]
+    low = shifted[..., 1::2]
+    return ((high << 4) | low).contiguous()
+
+def unpack_int4_signed(packed: Tensor, n_cols: int) -> Tensor:
+    """Inverse of pack_int4_signed. Returns int8 in [-7..7]."""
+    R = packed.shape[0] if packed.ndim == 2 else None
+    half = packed.shape[-1]
+    assert n_cols == half * 2
+    shape_out = (R, n_cols) if R is not None else (n_cols,)
+    out = torch.empty(shape_out, dtype=torch.int8)
+    out[..., 0::2] = ((packed >> 4) & 0x0F).to(torch.int8) - 7
+    out[..., 1::2] = (packed & 0x0F).to(torch.int8) - 7
+    return out
+
+def quantize_state_dict_int4_qat(state_dict: dict[str, Tensor]):
+    """QAT-matched quantizer: int4 symmetric per-row for CastedLinear weights (4-bit packed),
+    int8 absmax for tok_emb (not affected by QAT during training), passthrough for the rest."""
+    quantized_packed: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    shapes: dict[str, tuple] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    embed_quantized: dict[str, Tensor] = {}
+    embed_scales: dict[str, Tensor] = {}
+    embed_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_qat_int4", "num_emb_int8", "int8_payload_bytes"),
+        0,
+    )
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        if not t.is_floating_point():
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        if "tok_emb.weight" in name:
+            # Embedding wasn't covered by QAT (nn.Embedding, not CastedLinear). Use int8 absmax.
+            q, s = quantize_float_tensor_int6(t, bits=8, sd_k=20.0)
+            embed_quantized[name] = q
+            embed_scales[name] = s
+            embed_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["num_emb_int8"] += 1
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+            continue
+        # CastedLinear weight: matched int4 symmetric per-row
+        if t.ndim != 2 or t.shape[1] % 2 != 0:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        q, s = quantize_float_tensor_int4_symmetric(t)
+        packed = pack_int4_signed(q)
+        quantized_packed[name] = packed
+        scales[name] = s
+        shapes[name] = tuple(t.shape)
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["num_qat_int4"] += 1
+        stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
+    obj: dict[str, object] = {
+        "__quant_format__": "qat_int4_per_row_v1",
+        "quantized_packed": quantized_packed,
+        "scales": scales,
+        "shapes": shapes,
+        "dtypes": dtypes,
+        "embed_quantized": embed_quantized,
+        "embed_scales": embed_scales,
+        "embed_dtypes": embed_dtypes,
+        "passthrough": passthrough,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+def dequantize_state_dict_int4_qat(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, packed in obj["quantized_packed"].items():
+        shape = obj["shapes"][name]
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name].to(dtype=torch.float32)
+        n_cols = shape[1]
+        q = unpack_int4_signed(packed, n_cols)
+        out[name] = (q.float() * s[:, None]).to(dtype=dtype).contiguous()
+    for name, q in obj.get("embed_quantized", {}).items():
+        s = obj["embed_scales"][name].to(dtype=torch.float32)
+        dtype = getattr(torch, obj["embed_dtypes"][name])
+        if s.ndim > 0:
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+        else:
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
 def generate_ar_calibration(model: nn.Module, device: torch.device, vocab_size: int = 1024,
                             seed: int = 42) -> list[Tensor]:
     n_seqs = 16
@@ -688,9 +821,21 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, **kwargs):
+        super().__init__(in_features, out_features, bias=bias, **kwargs)
+        # Runtime tensor flag for QAT (NOT a Python bool — would constant-fold under torch.compile).
+        # When 0.0 → normal forward (w_used == w). When 1.0 → STE int4 fake quant active.
+        self.register_buffer("qat_alpha", torch.zeros((), dtype=torch.float32), persistent=False)
+
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        w = self.weight
+        if w.ndim == 2:
+            # Symmetric per-row int4 fake quant. qmax=7 for [-7..7].
+            scale = w.detach().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 7.0
+            w_dq = (w / scale).round().clamp(-7.0, 7.0) * scale
+            w = w + self.qat_alpha.to(w.dtype) * (w_dq - w).detach()
+        return F.linear(x, w.to(x.dtype), bias)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
@@ -900,29 +1045,34 @@ class GPT(nn.Module):
 def _ensure_sp4096_data() -> None:
     if os.path.exists("./data/tokenizers/fineweb_4096_bpe.model") and len(glob.glob("./data/datasets/fineweb10B_sp4096/fineweb_train_*.bin")) > 0:
         return
-    from huggingface_hub import hf_hub_download, list_repo_tree
-    import shutil
+    try:
+        import hf_transfer  # noqa: F401
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "hf_transfer"])
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    from huggingface_hub import snapshot_download
     REPO = "idan3011/parameter-golf-sp4096"
     max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 80))
-    os.makedirs("data/tokenizers", exist_ok=True)
-    os.makedirs("data/datasets/fineweb10B_sp4096", exist_ok=True)
-    train_count = 0
-    for f in list_repo_tree(REPO, repo_type="dataset", recursive=True):
-        if not hasattr(f, "size"): continue
-        p = f.path
-        if not (p.endswith(".bin") or p.endswith(".model") or p.endswith(".vocab")): continue
-        is_train = "fineweb_train_" in p
-        if is_train and max_train_shards > 0 and train_count >= max_train_shards:
-            continue
-        dst = "data/" + p
-        if os.path.exists(dst):
-            if is_train: train_count += 1
-            continue
-        print(f"  downloading {p}...", flush=True)
-        src = hf_hub_download(REPO, p.split("/")[-1], subfolder="/".join(p.split("/")[:-1]), repo_type="dataset")
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
-        if is_train: train_count += 1
+    token = os.environ.get("HF_TOKEN")
+    allow = [
+        "tokenizers/fineweb_4096_bpe.model",
+        "tokenizers/fineweb_4096_bpe.vocab",
+        "datasets/fineweb10B_sp4096/fineweb_val_*.bin",
+    ]
+    if max_train_shards > 0:
+        allow.extend(
+            f"datasets/fineweb10B_sp4096/fineweb_train_{i:06d}.bin"
+            for i in range(max_train_shards)
+        )
+    print(f"[hf] downloading sp4096 dataset ({max_train_shards} train shards + val + tokenizer)", flush=True)
+    snapshot_download(
+        repo_id=REPO, repo_type="dataset",
+        allow_patterns=allow, local_dir="data", token=token,
+        max_workers=16,
+    )
+    print("[hf] download complete", flush=True)
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -1174,6 +1324,12 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        if args.use_qat:
+            qat_on = 1.0 if scale < args.late_qat_lr_threshold else 0.0
+            for _m in base_model.modules():
+                if isinstance(_m, CastedLinear):
+                    _m.qat_alpha.fill_(qat_on)
+
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1229,13 +1385,50 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     del ema_state
-    apply_gptq_inplace(base_model, device, args, log_fn=log0)
+    if master_process:
+        torch.save(base_model.state_dict(), "final_model.float.pt")
+        _fsz = os.path.getsize("final_model.float.pt")
+        log0(f"Saved pre-GPTQ float checkpoint: final_model.float.pt ({_fsz} bytes)")
+    if args.use_qat:
+        # DIAGNOSTIC: apples-to-apples quant gap on the SAME EMA+SWA-blended weights.
+        # diag_post_ema_clean: clean float forward (qat_alpha=0)
+        # diag_post_ema_fakequant: STE int4 fake-quant forward (qat_alpha=1)
+        # Difference is the TRUE quantization damage on the smoothed weights.
+        for _m in base_model.modules():
+            if isinstance(_m, CastedLinear):
+                _m.qat_alpha.fill_(0.0)
+        torch.cuda.synchronize()
+        _td = time.perf_counter()
+        _diag_clean_loss, _diag_clean_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(f"diag_post_ema_clean val_loss:{_diag_clean_loss:.4f} val_bpb:{_diag_clean_bpb:.6f} eval_time:{1000.0 * (time.perf_counter() - _td):.0f}ms")
+        for _m in base_model.modules():
+            if isinstance(_m, CastedLinear):
+                _m.qat_alpha.fill_(1.0)
+        torch.cuda.synchronize()
+        _td = time.perf_counter()
+        _diag_fq_loss, _diag_fq_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(f"diag_post_ema_fakequant val_loss:{_diag_fq_loss:.4f} val_bpb:{_diag_fq_bpb:.6f} eval_time:{1000.0 * (time.perf_counter() - _td):.0f}ms")
+        log0(f"diag_quant_gap_fakequant_minus_clean: {_diag_fq_bpb - _diag_clean_bpb:+.6f}")
+        log0("qat: skipping AR self-gen GPTQ (matched int4 quantizer will run instead)")
+    else:
+        apply_gptq_inplace(base_model, device, args, log_fn=log0)
     export_sd = base_model.state_dict()
     if master_process:
         torch.save(export_sd, "final_model.pt")
         sz = os.path.getsize("final_model.pt"); csz = len(code.encode("utf-8"))
         log0(f"Serialized model: {sz} bytes  Code: {csz}  Total: {sz + csz}")
-    quant_obj, quant_stats = quantize_state_dict_int6(export_sd)
+    if args.use_qat:
+        quant_obj, quant_stats = quantize_state_dict_int4_qat(export_sd)
+    else:
+        quant_obj, quant_stats = quantize_state_dict_int6(export_sd)
     quant_buf = io.BytesIO(); torch.save(quant_obj, quant_buf); quant_raw = quant_buf.getvalue()
     quant_blob = brotli.compress(_byte_shuffle(quant_raw), quality=11)
     if master_process:
@@ -1249,7 +1442,15 @@ def main() -> None:
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if quant_state.get("__quant_format__") == "qat_int4_per_row_v1":
+        _dequant_fn = dequantize_state_dict_int4_qat
+    else:
+        _dequant_fn = dequantize_state_dict_int8
+    base_model.load_state_dict(_dequant_fn(quant_state), strict=True)
+    if args.use_qat:
+        for _m in base_model.modules():
+            if isinstance(_m, CastedLinear):
+                _m.qat_alpha.fill_(0.0)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1268,30 +1469,37 @@ def main() -> None:
     torch.cuda.synchronize()
     log0(f"final_sliding_window val_bpb:{sw_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
     log0(f"final_sliding_window_exact val_bpb:{sw_val_bpb:.8f}")
-    ttt_model = GPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        num_loops=args.num_loops, loop_start=args.loop_start, loop_end=args.loop_end,
-    ).to(device).bfloat16()
-    for m in ttt_model.modules():
-        if isinstance(m, CastedLinear): m.float()
-    restore_low_dim_params_to_fp32(ttt_model)
-    ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_ttt = time.perf_counter()
-    ttt_model = torch.compile(ttt_model)
-    log0("ttt: starting")
-    ttt_bpb = eval_val_ttt(
-        args, ttt_model, rank, world_size, device,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        log_fn=log0,
-    )
-    torch.cuda.synchronize()
-    log0(f"final_ttt val_bpb:{ttt_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
-    log0(f"final_ttt_exact val_bpb:{ttt_bpb:.8f}")
-    del ttt_model
+    if args.skip_ttt:
+        log0("ttt: skipped (skip_ttt=True)")
+    else:
+        ttt_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            num_loops=args.num_loops, loop_start=args.loop_start, loop_end=args.loop_end,
+        ).to(device).bfloat16()
+        for m in ttt_model.modules():
+            if isinstance(m, CastedLinear): m.float()
+        restore_low_dim_params_to_fp32(ttt_model)
+        ttt_model.load_state_dict(_dequant_fn(quant_state), strict=True)
+        if args.use_qat:
+            for _m in ttt_model.modules():
+                if isinstance(_m, CastedLinear):
+                    _m.qat_alpha.fill_(0.0)
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_model = torch.compile(ttt_model)
+        log0("ttt: starting")
+        ttt_bpb = eval_val_ttt(
+            args, ttt_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            log_fn=log0,
+        )
+        torch.cuda.synchronize()
+        log0(f"final_ttt val_bpb:{ttt_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+        log0(f"final_ttt_exact val_bpb:{ttt_bpb:.8f}")
+        del ttt_model
     if distributed:
         dist.destroy_process_group()
 
