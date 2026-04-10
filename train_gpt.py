@@ -922,29 +922,29 @@ class GPT(nn.Module):
 def _ensure_sp9000_data() -> None:
     if os.path.exists("./data/tokenizers/fineweb_9000_bpe.model") and len(glob.glob("./data/datasets/fineweb10B_sp9000/fineweb_train_*.bin")) > 0:
         return
-    from huggingface_hub import hf_hub_download, list_repo_tree
+    from huggingface_hub import snapshot_download
     import shutil
     REPO = "Idan3011/parameter-golf-sp9000"
-    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 80))
+    print("  downloading sp9000 data from HF (bulk)...", flush=True)
+    cache_dir = snapshot_download(REPO, repo_type="dataset", allow_patterns=["*.bin", "*.model", "*.vocab"])
     os.makedirs("data/tokenizers", exist_ok=True)
     os.makedirs("data/datasets/fineweb10B_sp9000", exist_ok=True)
-    train_count = 0
-    for f in list_repo_tree(REPO, repo_type="dataset", recursive=True):
-        if not hasattr(f, "size"): continue
-        p = f.path
-        if not (p.endswith(".bin") or p.endswith(".model") or p.endswith(".vocab")): continue
-        is_train = "fineweb_train_" in p
-        if is_train and max_train_shards > 0 and train_count >= max_train_shards:
-            continue
-        dst = "data/" + p
-        if os.path.exists(dst):
-            if is_train: train_count += 1
-            continue
-        print(f"  downloading {p}...", flush=True)
-        src = hf_hub_download(REPO, p.split("/")[-1], subfolder="/".join(p.split("/")[:-1]), repo_type="dataset")
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
-        if is_train: train_count += 1
+    for root, _, files in os.walk(cache_dir):
+        for fname in files:
+            if not (fname.endswith(".bin") or fname.endswith(".model") or fname.endswith(".vocab")):
+                continue
+            src = os.path.join(root, fname)
+            if "tokenizers" in root:
+                dst = os.path.join("data/tokenizers", fname)
+            elif "datasets" in root:
+                dst = os.path.join("data/datasets/fineweb10B_sp9000", fname)
+            else:
+                continue
+            if os.path.exists(dst):
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"  copied {fname}", flush=True)
 
 def main() -> None:
     global zeropower_via_newtonschulz5
