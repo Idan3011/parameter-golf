@@ -33,6 +33,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+try:
+    from flash_attn import flash_attn_func
+    HAS_FA3 = True
+except ImportError:
+    HAS_FA3 = False
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
@@ -57,7 +63,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = 3.5
+    mlp_mult = 4.0
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
@@ -771,7 +777,15 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads))
+        if HAS_FA3:
+            y = flash_attn_func(
+                q.transpose(1, 2).contiguous(),
+                k.transpose(1, 2).contiguous(),
+                v.transpose(1, 2).contiguous(),
+                causal=True,
+            ).transpose(1, 2)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads))
         if self.use_xsa:
             vn = F.normalize(v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), dim=-1)
             y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
@@ -861,14 +875,11 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
         parallel_start = 7
-        xsa_last_n = 4
         self.blocks = nn.ModuleList(
             [
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                      rope_base, qk_gain_init,
-                      use_xsa=(i >= num_layers - xsa_last_n),
-                      leaky=True, layer_idx=i,
-                      parallel_residual=(i >= parallel_start))
+                      rope_base, qk_gain_init, use_xsa=True, leaky=True,
+                      layer_idx=i, parallel_residual=(i >= parallel_start))
                 for i in range(num_layers)
             ]
         )
@@ -1105,7 +1116,7 @@ def main() -> None:
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
-        warmdown_frac = 0.69
+        warmdown_frac = 0.72
         return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
 
     if args.warmup_steps > 0:
