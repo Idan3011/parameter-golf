@@ -103,15 +103,18 @@ class Hyperparameters:
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
+    if X.ndim == 2:
+        X /= X.norm() + eps
+    else:
+        X /= X.flatten(1).norm(dim=1)[:, None, None] + eps
+    transposed = X.size(-2) > X.size(-1)
     if transposed:
-        X = X.T
+        X = X.transpose(-2, -1)
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.transpose(-2, -1)
         B = b * A + c * A @ A
         X = a * X + B @ X
-    return X.T if transposed else X
+    return X.transpose(-2, -1) if transposed else X
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
@@ -119,8 +122,10 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
+        self._banks: list[dict] | None = None
+        self._ordered_params: list[Tensor] | None = None
+        self._ordered_views: list[Tensor] | None = None
         self._updates_flat: Tensor | None = None
-        self._param_views: list[Tensor] | None = None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -128,10 +133,6 @@ class Muon(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
 
         for group in self.param_groups:
             params = group["params"]
@@ -142,36 +143,44 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
-            if self._updates_flat is None:
+            if self._banks is None:
+                device = params[0].device
                 total = sum(int(p.numel()) for p in params)
-                self._updates_flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
-                views, c = [], 0
-                for p in params:
-                    views.append(self._updates_flat[c : c + p.numel()].view_as(p))
-                    c += p.numel()
-                self._param_views = views
+                self._updates_flat = torch.zeros(total, device=device, dtype=torch.bfloat16)
+                shape_groups: dict[tuple, list[int]] = {}
+                for i, p in enumerate(params):
+                    s = p.shape
+                    if s not in shape_groups:
+                        shape_groups[s] = []
+                    shape_groups[s].append(i)
+                self._banks = []
+                self._ordered_params = []
+                self._ordered_views = []
+                offset = 0
+                for shape, indices in shape_groups.items():
+                    n = len(indices)
+                    bank_numel = n * shape[0] * shape[1]
+                    region = self._updates_flat[offset : offset + bank_numel].view(n, *shape)
+                    self._banks.append({
+                        "indices": indices,
+                        "scale": max(1, shape[0] / shape[1]) ** 0.5,
+                        "region": region,
+                        "mom_buf": torch.zeros(n, *shape, device=device),
+                    })
+                    for j, i in enumerate(indices):
+                        self._ordered_params.append(params[i])
+                        self._ordered_views.append(region[j])
+                    offset += bank_numel
             self._updates_flat.zero_()
 
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    self._updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
+            for bank in self._banks:
+                grad_stack = torch.stack([params[i].grad for i in bank["indices"]])
+                bank["mom_buf"].mul_(momentum).add_(grad_stack)
+                g = grad_stack.add(bank["mom_buf"], alpha=momentum) if nesterov else bank["mom_buf"]
+                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                bank["region"].copy_(g * bank["scale"])
 
-            if distributed:
-                dist.all_reduce(self._updates_flat, op=dist.ReduceOp.SUM)
-
-            torch._foreach_add_(params, self._param_views, alpha=-lr)
+            torch._foreach_add_(self._ordered_params, self._ordered_views, alpha=-lr)
 
         return loss
 
@@ -1210,9 +1219,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         with torch.no_grad():
