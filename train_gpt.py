@@ -57,7 +57,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = 3.5
+    mlp_mult = 3.75
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
@@ -861,11 +861,14 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
         parallel_start = 7
+        xsa_last_n = 4
         self.blocks = nn.ModuleList(
             [
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                      rope_base, qk_gain_init, use_xsa=True, leaky=True,
-                      layer_idx=i, parallel_residual=(i >= parallel_start))
+                      rope_base, qk_gain_init,
+                      use_xsa=(i >= num_layers - xsa_last_n),
+                      leaky=True, layer_idx=i,
+                      parallel_residual=(i >= parallel_start))
                 for i in range(num_layers)
             ]
         )
@@ -1102,7 +1105,7 @@ def main() -> None:
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
-        warmdown_frac = 0.72
+        warmdown_frac = 0.69
         return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
 
     if args.warmup_steps > 0:
@@ -1251,6 +1254,9 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     del ema_state
+    if master_process:
+        torch.save(base_model.state_dict(), "final_model.float.pt")
+        log0(f"saved pre-GPTQ float checkpoint: {os.path.getsize('final_model.float.pt')} bytes")
     gptq_scales = apply_gptq_sdclip_inplace(base_model, device, args, log_fn=log0)
     export_sd = base_model.state_dict()
     if master_process:
