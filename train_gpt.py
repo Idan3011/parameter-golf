@@ -57,7 +57,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = 3.75
+    mlp_mult = 3.5
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
