@@ -63,11 +63,11 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = 5.25
     vocab_size = 9000
-    num_layers = 11
+    num_layers = 12
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = 4.0
+    mlp_mult = 3.5
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
@@ -89,7 +89,7 @@ class Hyperparameters:
     adam_wd = 0.095
     ema_decay = 0.9965
     num_loops = 2
-    loop_start = 3
+    loop_start = 4
     loop_end = 5
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     ttt_chunk_tokens = 131072
@@ -119,6 +119,8 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
+        self._updates_flat: Tensor | None = None
+        self._param_views: list[Tensor] | None = None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -140,8 +142,15 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            if self._updates_flat is None:
+                total = sum(int(p.numel()) for p in params)
+                self._updates_flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
+                views, c = [], 0
+                for p in params:
+                    views.append(self._updates_flat[c : c + p.numel()].view_as(p))
+                    c += p.numel()
+                self._param_views = views
+            self._updates_flat.zero_()
 
             curr = 0
             for i, p in enumerate(params):
@@ -156,17 +165,13 @@ class Muon(torch.optim.Optimizer):
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                    self._updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
             if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+                dist.all_reduce(self._updates_flat, op=dist.ReduceOp.SUM)
 
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
-                curr += p.numel()
+            torch._foreach_add_(params, self._param_views, alpha=-lr)
 
         return loss
 
@@ -712,8 +717,7 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
@@ -728,11 +732,10 @@ class Rotary(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        # Recompute every call so the returned tensors never leak through inference_mode caches.
         t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq.to(device))
-        cos = freqs.cos()[None, None, :, :].to(dtype=dtype)
-        sin = freqs.sin()[None, None, :, :].to(dtype=dtype)
+        cos = freqs.cos()[None, :, None, :].to(dtype=dtype)
+        sin = freqs.sin()[None, :, None, :].to(dtype=dtype)
         return cos, sin
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -741,15 +744,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-        use_xsa: bool = False,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, qk_gain_init: float, use_xsa: bool = False):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -767,33 +762,29 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
         self.use_xsa = use_xsa
 
-    def forward(self, x: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         if HAS_FA3:
-            y = flash_attn_func(
-                q.transpose(1, 2).contiguous(),
-                k.transpose(1, 2).contiguous(),
-                v.transpose(1, 2).contiguous(),
-                causal=True,
-            ).transpose(1, 2)
+            y = flash_attn_func(q, k, v, causal=True)
         else:
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads))
+            y = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads)
+            ).transpose(1, 2)
         if self.use_xsa:
-            vn = F.normalize(v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), dim=-1)
+            vn = F.normalize(v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2), dim=-1)
             y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = y.reshape(bsz, seqlen, dim)
         return self.proj(y), v
 
 class MLP(nn.Module):
@@ -811,27 +802,27 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
-                 rope_base: float, qk_gain_init: float, use_xsa: bool = False, leaky: bool = True,
+                 qk_gain_init: float, use_xsa: bool = False, leaky: bool = True,
                  layer_idx: int = 0, parallel_residual: bool = False):
         super().__init__()
         self.parallel_residual = parallel_residual
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_xsa=use_xsa)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, qk_gain_init, use_xsa=use_xsa)
         self.mlp = MLP(dim, mlp_mult, leaky=leaky)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         if self.parallel_residual:
-            attn_out, v = self.attn(self.attn_norm(x), v0)
+            attn_out, v = self.attn(self.attn_norm(x), cos, sin, v0)
             mlp_out = self.mlp(self.mlp_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         else:
-            attn_out, v = self.attn(self.attn_norm(x), v0)
+            attn_out, v = self.attn(self.attn_norm(x), cos, sin, v0)
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x, v
@@ -878,11 +869,12 @@ class GPT(nn.Module):
         self.decoder_indices = all_indices[self.num_encoder_layers :]
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.rotary = Rotary(model_dim // num_heads, base=rope_base)
         parallel_start = 7
         self.blocks = nn.ModuleList(
             [
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                      rope_base, qk_gain_init, use_xsa=True, leaky=True,
+                      qk_gain_init, use_xsa=True, leaky=True,
                       layer_idx=i, parallel_residual=(i >= parallel_start))
                 for i in range(num_layers)
             ]
@@ -905,10 +897,11 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
+        cos, sin = self.rotary(x.size(1), x.device, x.dtype)
         v0 = None
         skips: list[Tensor] = []
         for block_idx in self.encoder_indices:
-            x, v = self.blocks[block_idx](x, x0, v0)
+            x, v = self.blocks[block_idx](x, x0, cos, sin, v0)
             if v0 is None:
                 v0 = v
             skips.append(x)
@@ -917,7 +910,7 @@ class GPT(nn.Module):
                 skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
                 x = x + gate * skip
-            x, _ = self.blocks[block_idx](x, x0, v0)
+            x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
         return x
 
     def _compute_logits(self, x: Tensor) -> Tensor:
@@ -1152,6 +1145,10 @@ def main() -> None:
     training_time_ms = 0.0
     stop_after_step: int | None = None
     ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
+    _ema_keys = list(ema_state.keys())
+    _ema_param_map = dict(base_model.named_parameters())
+    _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
+    _ema_state_refs = [ema_state[k] for k in _ema_keys]
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     torch.cuda.synchronize()
@@ -1220,17 +1217,16 @@ def main() -> None:
             opt.step()
         with torch.no_grad():
             muon_lr = optimizer_muon.param_groups[0]["lr"]
-            for p in matrix_params:
-                p.mul_(1.0 - args.muon_wd * muon_lr)
+            torch._foreach_mul_(matrix_params, 1.0 - args.muon_wd * muon_lr)
         zero_grad_all()
 
         step += 1
         _ema_d = args.ema_decay
         with torch.no_grad():
-            for k, v in base_model.state_dict().items():
-                ema_state[k].mul_(_ema_d).add_(v.detach().float(), alpha=1.0 - _ema_d)
+            torch._foreach_mul_(_ema_state_refs, _ema_d)
+            torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
             if scale < 0.5 and step % 5 == 0:
-                sd = {k: v.detach().cpu().float() for k, v in base_model.state_dict().items()}
+                sd = {k: p.detach().cpu().float() for k, p in zip(_ema_keys, _ema_model_refs)}
                 if swa_state is None: swa_state, swa_count = sd, 1
                 else:
                     for k in swa_state: swa_state[k] += sd[k]
