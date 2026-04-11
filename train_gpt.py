@@ -57,17 +57,17 @@ class Hyperparameters:
     train_log_every = 200
     iterations = 20000
     warmdown_iters = 3500
-    warmup_steps = 20
+    warmup_steps = 3
     train_batch_tokens = 786_432
     train_seq_len = 2048
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = 5.25
     vocab_size = 9000
-    num_layers = 11
+    num_layers = 12
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = 4.0
+    mlp_mult = 3.5
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
@@ -88,8 +88,10 @@ class Hyperparameters:
     muon_wd = 0.095
     adam_wd = 0.095
     ema_decay = 0.9965
+    skip_ema = bool(int(os.environ.get("SKIP_EMA", "0")))
+    last_block_wd = float(os.environ.get("LAST_BLOCK_WD", "0"))
     num_loops = 2
-    loop_start = 3
+    loop_start = 4
     loop_end = 5
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     ttt_chunk_tokens = 131072
@@ -787,8 +789,11 @@ class CausalSelfAttention(nn.Module):
                 attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads)
             ).transpose(1, 2)
         if self.use_xsa:
-            vn = F.normalize(v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2), dim=-1)
-            y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
+            hpk = self.num_heads // self.num_kv_heads
+            y_kv = y.unflatten(2, (self.num_kv_heads, hpk))
+            vn = F.normalize(v, dim=-1)[:, :, :, None, :]
+            proj = (y_kv * vn).sum(dim=-1, keepdim=True)
+            y = (y_kv - proj * vn).flatten(2, 3)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y), v
 
@@ -1054,11 +1059,22 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
+    last_block_idx = args.num_layers - 1
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if args.last_block_wd > 0:
+        last_block_matrix = [
+            p for name, p in block_named_params
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            and name.startswith(f"{last_block_idx}.")
+        ]
+        other_matrix = [p for p in matrix_params if not any(p is lb for lb in last_block_matrix)]
+    else:
+        last_block_matrix = []
+        other_matrix = matrix_params
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1154,6 +1170,13 @@ def main() -> None:
     _ema_param_map = dict(base_model.named_parameters())
     _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
     _ema_state_refs = [ema_state[k] for k in _ema_keys]
+    skip_ema_last = bool(int(os.environ.get("SKIP_EMA_LAST_BLOCK", "0")))
+    if skip_ema_last:
+        _last_b = f"blocks.{args.num_layers - 1}."
+        _ema_main_model = [r for r, k in zip(_ema_model_refs, _ema_keys) if _last_b not in k]
+        _ema_main_state = [r for r, k in zip(_ema_state_refs, _ema_keys) if _last_b not in k]
+        _ema_last_model = [r for r, k in zip(_ema_model_refs, _ema_keys) if _last_b in k]
+        _ema_last_state = [r for r, k in zip(_ema_state_refs, _ema_keys) if _last_b in k]
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     torch.cuda.synchronize()
@@ -1219,14 +1242,24 @@ def main() -> None:
             opt.step()
         with torch.no_grad():
             muon_lr = optimizer_muon.param_groups[0]["lr"]
-            torch._foreach_mul_(matrix_params, 1.0 - args.muon_wd * muon_lr)
-        zero_grad_all()
+            if args.last_block_wd > 0:
+                torch._foreach_mul_(other_matrix, 1.0 - args.muon_wd * muon_lr)
+                torch._foreach_mul_(last_block_matrix, 1.0 - args.last_block_wd * muon_lr)
+            else:
+                torch._foreach_mul_(matrix_params, 1.0 - args.muon_wd * muon_lr)
 
         step += 1
         _ema_d = args.ema_decay
         with torch.no_grad():
-            torch._foreach_mul_(_ema_state_refs, _ema_d)
-            torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
+            if args.skip_ema:
+                pass
+            elif skip_ema_last:
+                torch._foreach_mul_(_ema_main_state, _ema_d)
+                torch._foreach_add_(_ema_main_state, _ema_main_model, alpha=1.0 - _ema_d)
+                torch._foreach_copy_(_ema_last_state, _ema_last_model)
+            else:
+                torch._foreach_mul_(_ema_state_refs, _ema_d)
+                torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
             if scale < 0.5 and step % 5 == 0:
                 sd = {k: p.detach().cpu().float() for k, p in zip(_ema_keys, _ema_model_refs)}
                 if swa_state is None: swa_state, swa_count = sd, 1
@@ -1245,7 +1278,7 @@ def main() -> None:
             )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-        if distributed and max_wallclock_ms is not None:
+        if distributed and max_wallclock_ms is not None and approx_training_time_ms >= 0.9 * max_wallclock_ms:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
             reached_cap = bool(reached_cap_tensor.item())
@@ -1253,7 +1286,10 @@ def main() -> None:
             stop_after_step = step
 
     log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
-    ema_state = {k: v.cpu() for k, v in ema_state.items()}
+    if args.skip_ema:
+        ema_state = {k: v.detach().cpu().float() for k, v in base_model.state_dict().items()}
+    else:
+        ema_state = {k: v.cpu() for k, v in ema_state.items()}
     if swa_state is not None and swa_count > 0:
         log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
         for k in swa_state:
