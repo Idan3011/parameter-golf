@@ -88,7 +88,7 @@ class Hyperparameters:
     muon_wd = 0.095
     adam_wd = 0.095
     ema_decay = 0.9965
-    skip_ema = bool(int(os.environ.get("SKIP_EMA", "0")))
+    skip_ema = True
     last_block_wd = float(os.environ.get("LAST_BLOCK_WD", "0"))
     num_loops = 2
     loop_start = 4
