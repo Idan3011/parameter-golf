@@ -48,13 +48,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 try:
     import triton
     import triton.language as tl
-    _FUSED_BLOCK_M, _FUSED_BLOCK_N, _FUSED_BLOCK_K = 64, 64, 32
+    _FM, _FN, _FK = 64, 64, 32
     @triton.jit
-    def _fused_fc_act_sq_fwd(
-        X, W, Out, M, N, K,
-        sx_m, sx_k, sw_n, sw_k, so_m, so_n,
-        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-    ):
+    def _fused_fc_act_sq_fwd(X, W, Out, M, N, K,
+                              sxm, sxk, swn, swk, som, son,
+                              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         pid = tl.program_id(0)
         pm, pn = pid // tl.cdiv(N, BN), pid % tl.cdiv(N, BN)
         om = pm * BM + tl.arange(0, BM)
@@ -62,28 +60,22 @@ try:
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         for ks in range(0, K, BK):
             ok = ks + tl.arange(0, BK)
-            a = tl.load(X + om[:, None] * sx_m + ok[None, :] * sx_k,
-                        mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
-            b = tl.load(W + ok[:, None] * sw_k + on[None, :] * sw_n,
-                        mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+            a = tl.load(X + om[:, None]*sxm + ok[None,:]*sxk, mask=(om[:, None]<M)&(ok[None,:]<K), other=0.)
+            b = tl.load(W + ok[:, None]*swk + on[None,:]*swn, mask=(ok[:, None]<K)&(on[None,:]<N), other=0.)
             acc = tl.dot(a, b, acc, allow_tf32=True)
         h = tl.where(acc > 0, acc, acc * 0.5)
         h = h * h
-        msk = (om[:, None] < M) & (on[None, :] < N)
-        tl.store(Out + om[:, None] * so_m + on[None, :] * so_n, h.to(tl.bfloat16), mask=msk)
+        tl.store(Out + om[:, None]*som + on[None,:]*son, h.to(tl.bfloat16), mask=(om[:, None]<M)&(on[None,:]<N))
 
     class _FusedFCActSq(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, w):
-            M, K = x.shape
-            N = w.shape[0]
+            M, K = x.shape; N = w.shape[0]
             out = torch.empty((M, N), device=x.device, dtype=x.dtype)
-            grid = (triton.cdiv(M, _FUSED_BLOCK_M) * triton.cdiv(N, _FUSED_BLOCK_N),)
-            _fused_fc_act_sq_fwd[grid](
-                x, w, out, M, N, K,
+            grid = (triton.cdiv(M, _FM) * triton.cdiv(N, _FN),)
+            _fused_fc_act_sq_fwd[grid](x, w, out, M, N, K,
                 x.stride(0), x.stride(1), w.stride(0), w.stride(1), out.stride(0), out.stride(1),
-                BM=_FUSED_BLOCK_M, BN=_FUSED_BLOCK_N, BK=_FUSED_BLOCK_K,
-            )
+                BM=_FM, BN=_FN, BK=_FK)
             ctx.save_for_backward(x, w)
             return out
         @staticmethod
@@ -145,7 +137,7 @@ class Hyperparameters:
     skip_swa = bool(int(os.environ.get("SKIP_SWA", "0")))
     last_block_wd = 0.50
     num_loops = 2
-    loop_start = 3
+    loop_start = 4
     loop_end = 5
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     ttt_chunk_tokens = 131072
