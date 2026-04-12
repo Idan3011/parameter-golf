@@ -67,7 +67,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = 3.5
+    mlp_mult = 4.0
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
@@ -88,8 +88,9 @@ class Hyperparameters:
     muon_wd = 0.095
     adam_wd = 0.095
     ema_decay = 0.9965
-    skip_ema = True
-    last_block_wd = float(os.environ.get("LAST_BLOCK_WD", "0"))
+    skip_ema = bool(int(os.environ.get("SKIP_EMA", "0")))
+    skip_swa = bool(int(os.environ.get("SKIP_SWA", "0")))
+    last_block_wd = 0.50
     num_loops = 2
     loop_start = 4
     loop_end = 5
@@ -1290,11 +1291,14 @@ def main() -> None:
         ema_state = {k: v.detach().cpu().float() for k, v in base_model.state_dict().items()}
     else:
         ema_state = {k: v.cpu() for k, v in ema_state.items()}
-    if swa_state is not None and swa_count > 0:
+    if swa_state is not None and swa_count > 0 and not args.skip_swa:
         log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
         for k in swa_state:
             swa_state[k] /= swa_count
             ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
+        del swa_state
+    elif swa_state is not None:
+        log0(f"swa: SKIPPED ({swa_count} checkpoints)")
         del swa_state
     log0("ema: loading weights")
     base_model.load_state_dict(ema_state, strict=True)
