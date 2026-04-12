@@ -77,22 +77,22 @@ class Hyperparameters:
     tied_embed_init_std = 0.005
     matrix_lr = 0.022
     scalar_lr = 0.025
-    muon_momentum = 0.97
+    muon_momentum = 0.99
     muon_backend_steps = 5
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 1500
     beta1 = 0.9
     beta2 = 0.95
     adam_eps = 1e-8
-    grad_clip_norm = 0.3
+    grad_clip_norm = 0.0
     muon_wd = 0.095
     adam_wd = 0.095
-    ema_decay = 0.997
+    ema_decay = 0.9965
     skip_ema = bool(int(os.environ.get("SKIP_EMA", "0")))
     skip_swa = bool(int(os.environ.get("SKIP_SWA", "0")))
     last_block_wd = 0.50
     num_loops = 2
-    loop_start = 4
+    loop_start = 3
     loop_end = 5
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     ttt_chunk_tokens = 131072
@@ -1135,7 +1135,7 @@ def main() -> None:
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
-        warmdown_frac = 0.667
+        warmdown_frac = 0.72
         return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
 
     if args.warmup_steps > 0:
@@ -1386,7 +1386,7 @@ def main() -> None:
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args, model, rank, world_size, device, grad_accum_steps,
+        args, base_model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
@@ -1395,7 +1395,7 @@ def main() -> None:
     torch.cuda.synchronize()
     t_slide = time.perf_counter()
     sw_val_loss, sw_val_bpb = eval_val_sliding(
-        args, model, rank, world_size, device,
+        args, base_model, rank, world_size, device,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
