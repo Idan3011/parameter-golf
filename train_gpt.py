@@ -666,13 +666,8 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
     Q = Q[:, inv_perm]
     return (Q * sf[:, None]).to(dtype=weight.dtype)
 
-<<<<<<< Updated upstream
-GPTQ_SD_K = 16.0
-GPTQ_CR = 31
-=======
 GPTQ_SD_K = float(os.environ.get("GPTQ_SD_K", "15.0"))
 GPTQ_CR = int(os.environ.get("GPTQ_CR", "31"))
->>>>>>> Stashed changes
 
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print) -> dict[str, Tensor]:
     """GPTQ with SD-Clip scale: sf = k * std(row) / cr. Returns per-layer scales."""
@@ -1111,86 +1106,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-<<<<<<< Updated upstream
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, mode="max-autotune-no-cudagraphs")
-=======
-    _requant_float = os.environ.get("REQUANT_FLOAT")
-    if _requant_float:
-        log0(f"REQUANT: loading {_requant_float}, GPTQ k={GPTQ_SD_K} cr={GPTQ_CR}")
-        sd = torch.load(_requant_float, map_location="cpu", weights_only=False)
-        base_model.load_state_dict(sd, strict=True); del sd
-        for m in base_model.modules():
-            if isinstance(m, CastedLinear): m.float()
-        restore_low_dim_params_to_fp32(base_model)
-        base_model.eval()
-        code = Path(__file__).read_text(encoding="utf-8")
-        gptq_scales = apply_gptq_sdclip_inplace(base_model, device, args, log_fn=log0)
-        export_sd = base_model.state_dict()
-        cr = GPTQ_CR
-        quantized_t, scales_t, dtypes_t, passthrough_t, qmeta_t = {}, {}, {}, {}, {}
-        passthrough_orig_dtypes_t = {}
-        for name, tensor in export_sd.items():
-            t = tensor.detach().cpu().contiguous()
-            if not t.is_floating_point():
-                passthrough_t[name] = t; continue
-            if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
-                passthrough_t[name] = t.float().contiguous(); continue
-            if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-                passthrough_t[name] = keep_float_tensor(name, t, passthrough_orig_dtypes_t); continue
-            if "tok_emb.weight" in name:
-                q, s = quantize_float_tensor_int6(t, bits=8)
-            elif name in gptq_scales:
-                sf = gptq_scales[name].float()
-                q = torch.clamp(torch.round(t.float() / sf[:, None]), -cr, cr).to(torch.int8).contiguous()
-                s = sf.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-            else:
-                q, s = quantize_float_tensor_int6(t, bits=6)
-            quantized_t[name] = q; scales_t[name] = s; dtypes_t[name] = str(t.dtype).removeprefix("torch.")
-            if s.ndim > 0: qmeta_t[name] = {"scheme": "per_row", "axis": 0}
-        quant_obj = {"__quant_format__": f"gptq_sdclip_cr{cr}_per_row_v1",
-                     "quantized": quantized_t, "scales": scales_t, "dtypes": dtypes_t, "passthrough": passthrough_t}
-        if qmeta_t: quant_obj["qmeta"] = qmeta_t
-        if passthrough_orig_dtypes_t: quant_obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes_t
-        quant_buf = io.BytesIO(); torch.save(quant_obj, quant_buf); quant_raw = quant_buf.getvalue()
-        quant_blob = brotli.compress(_byte_shuffle(quant_raw), quality=11)
-        if master_process:
-            with open("final_model.int6.ptz", "wb") as f: f.write(quant_blob)
-            qsz = len(quant_blob); csz = len(code.encode("utf-8"))
-            log0(f"Serialized model int6+brotli: {qsz} bytes")
-            log0(f"Total submission size: {qsz + csz} bytes")
-        if distributed: dist.barrier()
-        with open("final_model.int6.ptz", "rb") as f:
-            quant_state = torch.load(io.BytesIO(_decompress(f.read())), map_location="cpu")
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-        base_model = torch.compile(base_model)
-        base_model.eval()
-        torch.cuda.synchronize(); t_qeval = time.perf_counter()
-        q_val_loss, q_val_bpb = eval_val(args, base_model, rank, world_size, device, 8 // world_size,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-        log0(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000*(time.perf_counter()-t_qeval):.0f}ms")
-        if not args.skip_ttt:
-            ttt_model = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-                num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-                tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-                logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-                num_loops=args.num_loops, loop_start=args.loop_start, loop_end=args.loop_end,
-            ).to(device).bfloat16()
-            for m in ttt_model.modules():
-                if isinstance(m, CastedLinear): m.float()
-            restore_low_dim_params_to_fp32(ttt_model)
-            ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
-            ttt_model.eval_hash_emb = nn.Embedding(args.eval_hash_buckets, args.model_dim).to(device)
-            nn.init.zeros_(ttt_model.eval_hash_emb.weight)
-            log0(f"ttt: hash_emb attached ({args.eval_hash_buckets} buckets)")
-            ttt_model = torch.compile(ttt_model)
-            log0("ttt: starting")
-            ttt_bpb = eval_val_ttt(args, ttt_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, log_fn=log0)
-            log0(f"ttt val_bpb:{ttt_bpb:.4f} eval_time:{1000*(time.perf_counter()-t_qeval):.0f}ms")
-        if distributed: dist.destroy_process_group()
-        return
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
->>>>>>> Stashed changes
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
