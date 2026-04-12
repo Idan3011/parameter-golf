@@ -45,6 +45,59 @@ except ImportError:
         HAS_FA3 = False
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import triton
+    import triton.language as tl
+    _FUSED_BLOCK_M, _FUSED_BLOCK_N, _FUSED_BLOCK_K = 64, 64, 32
+    @triton.jit
+    def _fused_fc_act_sq_fwd(
+        X, W, Out, M, N, K,
+        sx_m, sx_k, sw_n, sw_k, so_m, so_n,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pm, pn = pid // tl.cdiv(N, BN), pid % tl.cdiv(N, BN)
+        om = pm * BM + tl.arange(0, BM)
+        on = pn * BN + tl.arange(0, BN)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for ks in range(0, K, BK):
+            ok = ks + tl.arange(0, BK)
+            a = tl.load(X + om[:, None] * sx_m + ok[None, :] * sx_k,
+                        mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+            b = tl.load(W + ok[:, None] * sw_k + on[None, :] * sw_n,
+                        mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+            acc = tl.dot(a, b, acc, allow_tf32=True)
+        h = tl.where(acc > 0, acc, acc * 0.5)
+        h = h * h
+        msk = (om[:, None] < M) & (on[None, :] < N)
+        tl.store(Out + om[:, None] * so_m + on[None, :] * so_n, h.to(tl.bfloat16), mask=msk)
+
+    class _FusedFCActSq(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, w):
+            M, K = x.shape
+            N = w.shape[0]
+            out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M, _FUSED_BLOCK_M) * triton.cdiv(N, _FUSED_BLOCK_N),)
+            _fused_fc_act_sq_fwd[grid](
+                x, w, out, M, N, K,
+                x.stride(0), x.stride(1), w.stride(0), w.stride(1), out.stride(0), out.stride(1),
+                BM=_FUSED_BLOCK_M, BN=_FUSED_BLOCK_N, BK=_FUSED_BLOCK_K,
+            )
+            ctx.save_for_backward(x, w)
+            return out
+        @staticmethod
+        def backward(ctx, grad_out):
+            x, w = ctx.saved_tensors
+            z = x @ w.t()
+            lk = torch.where(z > 0, z, z * 0.5)
+            dl = torch.where(z > 0, torch.ones_like(z), torch.full_like(z, 0.5))
+            gz = grad_out * 2.0 * lk * dl
+            return gz @ w, gz.t() @ x
+    HAS_FUSED_MLP = True
+except ImportError:
+    HAS_FUSED_MLP = False
+
 class Hyperparameters:
     data_path = "./data/datasets/fineweb10B_sp9000"
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -808,6 +861,11 @@ class MLP(nn.Module):
         self._leaky = leaky
 
     def forward(self, x: Tensor) -> Tensor:
+        if HAS_FUSED_MLP and self._leaky:
+            shape = x.shape
+            x2 = x.reshape(-1, shape[-1])
+            h = _FusedFCActSq.apply(x2, self.fc.weight.to(dtype=x2.dtype))
+            return self.proj(h.reshape(*shape[:-1], -1))
         x = F.leaky_relu(self.fc(x), 0.5) if self._leaky else torch.relu(self.fc(x))
         return self.proj(x.square())
 
