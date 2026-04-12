@@ -67,7 +67,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = 4.0
+    mlp_mult = 3.5
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
@@ -77,17 +77,17 @@ class Hyperparameters:
     tied_embed_init_std = 0.005
     matrix_lr = 0.022
     scalar_lr = 0.025
-    muon_momentum = 0.99
+    muon_momentum = 0.97
     muon_backend_steps = 5
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 1500
     beta1 = 0.9
     beta2 = 0.95
     adam_eps = 1e-8
-    grad_clip_norm = 0.0
+    grad_clip_norm = 0.3
     muon_wd = 0.095
     adam_wd = 0.095
-    ema_decay = 0.9965
+    ema_decay = 0.997
     skip_ema = bool(int(os.environ.get("SKIP_EMA", "0")))
     skip_swa = bool(int(os.environ.get("SKIP_SWA", "0")))
     last_block_wd = 0.50
@@ -621,13 +621,13 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
     Q = Q[:, inv_perm]
     return (Q * sf[:, None]).to(dtype=weight.dtype)
 
-GPTQ_SD_K = 15.0
+GPTQ_SD_K = 16.0
 GPTQ_CR = 31
 
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print) -> dict[str, Tensor]:
     """GPTQ with SD-Clip scale: sf = k * std(row) / cr. Returns per-layer scales."""
     t0 = time.perf_counter()
-    log_fn("gptq: generating AR calibration data...")
+    log_fn("gptq: generating AR calibration data (16 seqs)...")
     calib = generate_ar_calibration(model, device, vocab_size=args.vocab_size, seed=args.seed)
     log_fn(f"gptq: AR gen done in {time.perf_counter() - t0:.1f}s")
     t1 = time.perf_counter()
@@ -1135,7 +1135,7 @@ def main() -> None:
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
-        warmdown_frac = 0.72
+        warmdown_frac = 0.667
         return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
 
     if args.warmup_steps > 0:
@@ -1239,6 +1239,8 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         with torch.no_grad():
