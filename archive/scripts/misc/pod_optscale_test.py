@@ -118,8 +118,10 @@ def main():
     sd_orig = torch.load(FLOAT_HF, map_location="cpu", weights_only=False)
 
     configs = [
-        ("CONFIG 1: GPTQ k=12.85 + opt-scale + emb5", 12.85, 31, True, True, 5),
-        ("CONFIG 4: opt-scale k=12.85 + emb5 (NO GPTQ)", 12.85, 31, False, True, 5),
+        ("CONFIG A: GPTQ k=12.85 + emb5 (SOTA recipe)", 12.85, 31, True, False, 5),
+        ("CONFIG B: GPTQ k=12.85 + opt-scale + emb5", 12.85, 31, True, True, 5),
+        ("CONFIG C: opt-scale k=12.85 + emb5 (NO GPTQ)", 12.85, 31, False, True, 5),
+        ("CONFIG D: GPTQ k=15 + emb8 (baseline)", 15.0, 31, True, False, 8),
     ]
 
     for tag, k, cr, use_gptq, use_opt, emb_bits in configs:
@@ -182,6 +184,9 @@ def main():
 
         deq = tg.dequantize_state_dict_int8(quant_obj)
         model.load_state_dict(deq, strict=True)
+        for m in model.modules():
+            if isinstance(m, tg.CastedLinear): m.float()
+        tg.restore_low_dim_params_to_fp32(model)
         compiled = torch.compile(model)
         compiled.eval()
 
