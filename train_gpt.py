@@ -45,51 +45,6 @@ except ImportError:
         HAS_FA3 = False
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-try:
-    import triton
-    import triton.language as tl
-    _FM, _FN, _FK = 64, 64, 32
-    @triton.jit
-    def _fused_fc_act_sq_fwd(X, W, Out, M, N, K,
-                              sxm, sxk, swn, swk, som, son,
-                              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-        pid = tl.program_id(0)
-        pm, pn = pid // tl.cdiv(N, BN), pid % tl.cdiv(N, BN)
-        om = pm * BM + tl.arange(0, BM)
-        on = pn * BN + tl.arange(0, BN)
-        acc = tl.zeros((BM, BN), dtype=tl.float32)
-        for ks in range(0, K, BK):
-            ok = ks + tl.arange(0, BK)
-            a = tl.load(X + om[:, None]*sxm + ok[None,:]*sxk, mask=(om[:, None]<M)&(ok[None,:]<K), other=0.)
-            b = tl.load(W + ok[:, None]*swk + on[None,:]*swn, mask=(ok[:, None]<K)&(on[None,:]<N), other=0.)
-            acc = tl.dot(a, b, acc, allow_tf32=True)
-        h = tl.where(acc > 0, acc, acc * 0.5)
-        h = h * h
-        tl.store(Out + om[:, None]*som + on[None,:]*son, h.to(tl.bfloat16), mask=(om[:, None]<M)&(on[None,:]<N))
-
-    class _FusedFCActSq(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x, w):
-            M, K = x.shape; N = w.shape[0]
-            out = torch.empty((M, N), device=x.device, dtype=x.dtype)
-            grid = (triton.cdiv(M, _FM) * triton.cdiv(N, _FN),)
-            _fused_fc_act_sq_fwd[grid](x, w, out, M, N, K,
-                x.stride(0), x.stride(1), w.stride(0), w.stride(1), out.stride(0), out.stride(1),
-                BM=_FM, BN=_FN, BK=_FK)
-            ctx.save_for_backward(x, w)
-            return out
-        @staticmethod
-        def backward(ctx, grad_out):
-            x, w = ctx.saved_tensors
-            z = x @ w.t()
-            lk = torch.where(z > 0, z, z * 0.5)
-            dl = torch.where(z > 0, torch.ones_like(z), torch.full_like(z, 0.5))
-            gz = grad_out * 2.0 * lk * dl
-            return gz @ w, gz.t() @ x
-    HAS_FUSED_MLP = False
-except ImportError:
-    HAS_FUSED_MLP = False
-
 class Hyperparameters:
     data_path = "./data/datasets/fineweb10B_sp9000"
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -102,8 +57,8 @@ class Hyperparameters:
     train_log_every = 200
     iterations = 20000
     warmdown_iters = 3500
-    warmup_steps = 3
-    train_batch_tokens = 786_432
+    warmup_steps = 20
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", "786432"))
     train_seq_len = 2048
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = 5.25
@@ -112,7 +67,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 512
     num_heads = 8
-    mlp_mult = float(os.environ.get("MLP_MULT", "3.5"))
+    mlp_mult = 3.5
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
@@ -133,20 +88,20 @@ class Hyperparameters:
     muon_wd = 0.095
     adam_wd = 0.095
     ema_decay = 0.9965
-    skip_ema = bool(int(os.environ.get("SKIP_EMA", "0")))
-    skip_swa = bool(int(os.environ.get("SKIP_SWA", "0")))
-    last_block_wd = 0.50
     num_loops = 2
     loop_start = 4
     loop_end = 5
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
-    ttt_chunk_tokens = 131072
-    ttt_lr = 0.003
-    ttt_epochs = 20
+    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0"))
+    ttt_chunk_tokens = 32768
+    ttt_lr = 0.01
+    ttt_epochs = 3
     ttt_freeze_blocks = 0
     ttt_score_batch = 64
     ttt_train_batch = 32
     ttt_grad_clip = 1.0
+    eval_hash_buckets = 16384
+    eval_hash_lr_mult = 10.0
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -169,8 +124,6 @@ class Muon(torch.optim.Optimizer):
         )
         self._updates_flat: Tensor | None = None
         self._param_views: list[Tensor] | None = None
-        self._my_indices: list[int] | None = None
-        self._offsets: list[int] | None = None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -195,31 +148,28 @@ class Muon(torch.optim.Optimizer):
             if self._updates_flat is None:
                 total = sum(int(p.numel()) for p in params)
                 self._updates_flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
-                views, offsets, c = [], [], 0
+                views, c = [], 0
                 for p in params:
-                    offsets.append(c)
                     views.append(self._updates_flat[c : c + p.numel()].view_as(p))
                     c += p.numel()
                 self._param_views = views
-                self._offsets = offsets
-                self._my_indices = [i for i in range(len(params)) if i % world_size == rank]
             self._updates_flat.zero_()
 
-            for i in self._my_indices:
-                p = params[i]
-                if p.grad is None:
-                    continue
-                g = p.grad
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                self._updates_flat[self._offsets[i] : self._offsets[i] + p.numel()] = g.reshape(-1)
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    self._updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
 
             if distributed:
                 dist.all_reduce(self._updates_flat, op=dist.ReduceOp.SUM)
@@ -346,15 +296,19 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     T = torch.zeros((), device=device, dtype=torch.float64)
     B = torch.zeros((), device=device, dtype=torch.float64)
     _fr = lambda n: any(f"blocks.{bi}." in n for bi in range(min(freeze_n, len(base_model.blocks))))
-    ttt_params = [p for n, p in base_model.named_parameters() if not _fr(n)]
-    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
+    base_params = [p for n, p in base_model.named_parameters() if not _fr(n) and "eval_hash_emb" not in n]
+    hash_params = list(base_model.eval_hash_emb.parameters()) if base_model.eval_hash_emb is not None else []
+    param_groups = [{"params": base_params, "lr": ttt_lr}]
+    if hash_params:
+        param_groups.append({"params": hash_params, "lr": ttt_lr * args.eval_hash_lr_mult})
+    ttt_params = base_params + hash_params
+    opt = torch.optim.SGD(param_groups, momentum=0.9)
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
         my_s = (len(windows) * rank) // world_size
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
-        base_model.eval()
         with torch.no_grad():
             for bi in range(0, len(my_windows), score_bs):
                 bw = my_windows[bi:bi + score_bs]
@@ -376,7 +330,6 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
                 for pg in opt.param_groups: pg['lr'] = cos_lr
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
-                base_model.train()
                 for _ in range(ttt_epochs):
                     for bs in range(my_seq_s, my_seq_e, train_bs):
                         be = min(bs + train_bs, my_seq_e)
@@ -666,13 +619,13 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
     Q = Q[:, inv_perm]
     return (Q * sf[:, None]).to(dtype=weight.dtype)
 
-GPTQ_SD_K = float(os.environ.get("GPTQ_SD_K", "15.0"))
-GPTQ_CR = int(os.environ.get("GPTQ_CR", "31"))
+GPTQ_SD_K = 15.0
+GPTQ_CR = 31
 
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print) -> dict[str, Tensor]:
     """GPTQ with SD-Clip scale: sf = k * std(row) / cr. Returns per-layer scales."""
     t0 = time.perf_counter()
-    log_fn("gptq: generating AR calibration data (16 seqs)...")
+    log_fn("gptq: generating AR calibration data...")
     calib = generate_ar_calibration(model, device, vocab_size=args.vocab_size, seed=args.seed)
     log_fn(f"gptq: AR gen done in {time.perf_counter() - t0:.1f}s")
     t1 = time.perf_counter()
@@ -853,11 +806,6 @@ class MLP(nn.Module):
         self._leaky = leaky
 
     def forward(self, x: Tensor) -> Tensor:
-        if HAS_FUSED_MLP and self._leaky:
-            shape = x.shape
-            x2 = x.reshape(-1, shape[-1])
-            h = _FusedFCActSq.apply(x2, self.fc.weight.to(dtype=x2.dtype))
-            return self.proj(h.reshape(*shape[:-1], -1))
         x = F.leaky_relu(self.fc(x), 0.5) if self._leaky else torch.relu(self.fc(x))
         return self.proj(x.square())
 
@@ -926,8 +874,13 @@ class GPT(nn.Module):
         self.num_encoder_layers = len(all_indices) // 2
         self.num_decoder_layers = len(all_indices) - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.encoder_indices = all_indices[: self.num_encoder_layers]
-        self.decoder_indices = all_indices[self.num_encoder_layers :]
+        self._looped_enc = all_indices[: self.num_encoder_layers]
+        self._looped_dec = all_indices[self.num_encoder_layers :]
+        noloop = list(range(num_layers))
+        self._noloop_enc = noloop[: len(noloop) // 2]
+        self._noloop_dec = noloop[len(noloop) // 2 :]
+        self.encoder_indices = self._looped_enc
+        self.decoder_indices = self._looped_dec
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.rotary = Rotary(model_dim // num_heads, base=rope_base)
@@ -941,6 +894,8 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.eval_hash_emb: nn.Embedding | None = None
+        self.eval_hash_multiplier = 2039
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -983,6 +938,10 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.eval_hash_emb is not None:
+            prev = torch.cat([input_ids[:, :1], input_ids[:, :-1]], dim=1)
+            hash_ids = (prev.long() * self.eval_hash_multiplier + input_ids.long()) % self.eval_hash_emb.num_embeddings
+            x = x + self.eval_hash_emb(hash_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         x = self._run_blocks(x, x)
         x = self.final_norm(x)
@@ -1110,22 +1069,11 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
-    last_block_idx = args.num_layers - 1
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if args.last_block_wd > 0:
-        last_block_matrix = [
-            p for name, p in block_named_params
-            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-            and name.startswith(f"{last_block_idx}.")
-        ]
-        other_matrix = [p for p in matrix_params if not any(p is lb for lb in last_block_matrix)]
-    else:
-        last_block_matrix = []
-        other_matrix = matrix_params
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1188,6 +1136,9 @@ def main() -> None:
         warmdown_frac = 0.72
         return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
 
+    if args.enable_looping_at > 0 and args.num_loops > 0:
+        base_model.encoder_indices = base_model._noloop_enc
+        base_model.decoder_indices = base_model._noloop_dec
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1221,13 +1172,6 @@ def main() -> None:
     _ema_param_map = dict(base_model.named_parameters())
     _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
     _ema_state_refs = [ema_state[k] for k in _ema_keys]
-    skip_ema_last = bool(int(os.environ.get("SKIP_EMA_LAST_BLOCK", "0")))
-    if skip_ema_last:
-        _last_b = f"blocks.{args.num_layers - 1}."
-        _ema_main_model = [r for r, k in zip(_ema_model_refs, _ema_keys) if _last_b not in k]
-        _ema_main_state = [r for r, k in zip(_ema_state_refs, _ema_keys) if _last_b not in k]
-        _ema_last_model = [r for r, k in zip(_ema_model_refs, _ema_keys) if _last_b in k]
-        _ema_last_state = [r for r, k in zip(_ema_state_refs, _ema_keys) if _last_b in k]
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     torch.cuda.synchronize()
@@ -1268,6 +1212,12 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if args.enable_looping_at > 0 and base_model.encoder_indices is base_model._noloop_enc:
+            frac_done = elapsed_ms / max(max_wallclock_ms, 1.0) if max_wallclock_ms else step / args.iterations
+            if frac_done >= args.enable_looping_at:
+                base_model.encoder_indices = base_model._looped_enc
+                base_model.decoder_indices = base_model._looped_dec
+                log0(f"loop_activated step:{step} frac:{frac_done:.3f}")
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1289,30 +1239,21 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         with torch.no_grad():
             muon_lr = optimizer_muon.param_groups[0]["lr"]
-            if args.last_block_wd > 0:
-                torch._foreach_mul_(other_matrix, 1.0 - args.muon_wd * muon_lr)
-                torch._foreach_mul_(last_block_matrix, 1.0 - args.last_block_wd * muon_lr)
-            else:
-                torch._foreach_mul_(matrix_params, 1.0 - args.muon_wd * muon_lr)
+            torch._foreach_mul_(matrix_params, 1.0 - args.muon_wd * muon_lr)
+        zero_grad_all()
 
         step += 1
         _ema_d = args.ema_decay
         with torch.no_grad():
-            if args.skip_ema:
-                pass
-            elif skip_ema_last:
-                torch._foreach_mul_(_ema_main_state, _ema_d)
-                torch._foreach_add_(_ema_main_state, _ema_main_model, alpha=1.0 - _ema_d)
-                torch._foreach_copy_(_ema_last_state, _ema_last_model)
-            else:
-                torch._foreach_mul_(_ema_state_refs, _ema_d)
-                torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
+            torch._foreach_mul_(_ema_state_refs, _ema_d)
+            torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
             if scale < 0.5 and step % 5 == 0:
                 sd = {k: p.detach().cpu().float() for k, p in zip(_ema_keys, _ema_model_refs)}
                 if swa_state is None: swa_state, swa_count = sd, 1
@@ -1339,18 +1280,12 @@ def main() -> None:
             stop_after_step = step
 
     log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
-    if args.skip_ema:
-        ema_state = {k: v.detach().cpu().float() for k, v in base_model.state_dict().items()}
-    else:
-        ema_state = {k: v.cpu() for k, v in ema_state.items()}
-    if swa_state is not None and swa_count > 0 and not args.skip_swa:
+    ema_state = {k: v.cpu() for k, v in ema_state.items()}
+    if swa_state is not None and swa_count > 0:
         log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
         for k in swa_state:
             swa_state[k] /= swa_count
             ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
-        del swa_state
-    elif swa_state is not None:
-        log0(f"swa: SKIPPED ({swa_count} checkpoints)")
         del swa_state
     log0("ema: loading weights")
     base_model.load_state_dict(ema_state, strict=True)
@@ -1436,7 +1371,7 @@ def main() -> None:
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args, base_model, rank, world_size, device, grad_accum_steps,
+        args, model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
@@ -1445,7 +1380,7 @@ def main() -> None:
     torch.cuda.synchronize()
     t_slide = time.perf_counter()
     sw_val_loss, sw_val_bpb = eval_val_sliding(
-        args, base_model, rank, world_size, device,
+        args, model, rank, world_size, device,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
@@ -1464,7 +1399,10 @@ def main() -> None:
         for m in ttt_model.modules():
             if isinstance(m, CastedLinear): m.float()
         restore_low_dim_params_to_fp32(ttt_model)
-        ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
+        ttt_model.eval_hash_emb = nn.Embedding(args.eval_hash_buckets, args.model_dim).to(device)
+        nn.init.zeros_(ttt_model.eval_hash_emb.weight)
+        log0(f"ttt: hash_emb attached ({args.eval_hash_buckets} buckets, lr_mult={args.eval_hash_lr_mult})")
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_model = torch.compile(ttt_model)
