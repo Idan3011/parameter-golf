@@ -744,23 +744,6 @@ class Rotary(nn.Module):
         sin = freqs.sin()[None, :, None, :].to(dtype=dtype)
         return cos, sin
 
-class BufferedParamView(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q_gain_fp32: Tensor, q_gain_bf16_buf: Tensor) -> Tensor:
-        ctx.param_shape = q_gain_fp32.shape
-        return q_gain_bf16_buf
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor):
-        grad_fp32 = grad_output.to(torch.float32).reshape(ctx.param_shape)
-        return grad_fp32, None
-
-
-@torch.compiler.allow_in_graph
-def buffered_q_gain_view(q_gain_fp32: Tensor, q_gain_bf16_buf: Tensor) -> Tensor:
-    return BufferedParamView.apply(q_gain_fp32, q_gain_bf16_buf)
-
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
@@ -779,31 +762,26 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.c_attn = CastedLinear(dim, dim + 2 * kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.register_buffer("_q_gain_bf16", torch.empty(1, 1, num_heads, 1, dtype=torch.bfloat16), persistent=True)
         self.use_xsa = use_xsa
-
-    @torch.compiler.disable
-    def refresh_bf16_scalars(self) -> None:
-        with torch.no_grad():
-            self._q_gain_bf16.copy_(self.q_gain.detach().to(torch.bfloat16).view(1, 1, self.num_heads, 1))
+        self._q_split = dim
+        self._kv_split = kv_dim
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split((self._q_split, self._kv_split, self._kv_split), dim=-1)
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q_gain_view = buffered_q_gain_view(self.q_gain, self._q_gain_bf16)
-        q = q * q_gain_view
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         if HAS_FA3:
             y = flash_attn_func(q, k, v, causal=True)
         else:
@@ -846,10 +824,6 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-
-    @torch.compiler.disable
-    def refresh_bf16_scalars(self) -> None:
-        self.attn.refresh_bf16_scalars()
 
     def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -939,16 +913,6 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-
-    @torch.compiler.disable
-    def refresh_bf16_scalars(self) -> None:
-        for block in self.blocks:
-            block.refresh_bf16_scalars()
-
-    @torch.compiler.disable
-    def mark_static_bf16_buffers(self) -> None:
-        for block in self.blocks:
-            torch._dynamo.mark_static_address(block.attn._q_gain_bf16)
 
     def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
         cos, sin = self.rotary(x.size(1), x.device, x.dtype)
@@ -1103,8 +1067,6 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    base_model.refresh_bf16_scalars()
-    base_model.mark_static_bf16_buffers()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1194,12 +1156,10 @@ def main() -> None:
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
-            base_model.refresh_bf16_scalars()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
-        base_model.refresh_bf16_scalars()
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
@@ -1209,7 +1169,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    ema_state = {k: v.detach().clone().float() for k, v in base_model.named_parameters()}
+    ema_state = {k: v.detach().clone().float() for k, v in base_model.state_dict().items()}
     _ema_keys = list(ema_state.keys())
     _ema_param_map = dict(base_model.named_parameters())
     _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
@@ -1286,7 +1246,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        base_model.refresh_bf16_scalars()
         with torch.no_grad():
             muon_lr = optimizer_muon.param_groups[0]["lr"]
             torch._foreach_mul_(matrix_params, 1.0 - args.muon_wd * muon_lr)
@@ -1331,8 +1290,7 @@ def main() -> None:
             ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
         del swa_state
     log0("ema: loading weights")
-    base_model.load_state_dict(ema_state, strict=False)
-    base_model.refresh_bf16_scalars()
+    base_model.load_state_dict(ema_state, strict=True)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
