@@ -770,7 +770,7 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.use_xsa = use_xsa
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, q_gain_bf16: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -779,7 +779,7 @@ class CausalSelfAttention(nn.Module):
         k = F.rms_norm(k, (k.size(-1),))
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        q = q * q_gain_bf16.to(dtype=q.dtype)
         if HAS_FA3:
             y = flash_attn_func(q, k, v, causal=True)
         else:
@@ -823,15 +823,15 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, q_gain_bf16: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         if self.parallel_residual:
-            attn_out, v = self.attn(self.attn_norm(x), cos, sin, v0)
+            attn_out, v = self.attn(self.attn_norm(x), cos, sin, q_gain_bf16, v0)
             mlp_out = self.mlp(self.mlp_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         else:
-            attn_out, v = self.attn(self.attn_norm(x), cos, sin, v0)
+            attn_out, v = self.attn(self.attn_norm(x), cos, sin, q_gain_bf16, v0)
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x, v
@@ -914,10 +914,11 @@ class GPT(nn.Module):
 
     def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
         cos, sin = self.rotary(x.size(1), x.device, x.dtype)
+        q_gain_pack = torch.stack([blk.attn.q_gain for blk in self.blocks], dim=0).to(dtype=x.dtype).view(len(self.blocks), 1, 1, -1, 1)
         v0 = None
         skips: list[Tensor] = []
         for block_idx in self.encoder_indices:
-            x, v = self.blocks[block_idx](x, x0, cos, sin, v0)
+            x, v = self.blocks[block_idx](x, x0, cos, sin, q_gain_pack[block_idx], v0)
             if v0 is None:
                 v0 = v
             skips.append(x)
@@ -926,7 +927,7 @@ class GPT(nn.Module):
                 skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
                 x = x + gate * skip
-            x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
+            x, _ = self.blocks[block_idx](x, x0, cos, sin, q_gain_pack[block_idx], v0)
         return x
 
     def _compute_logits(self, x: Tensor) -> Tensor:
