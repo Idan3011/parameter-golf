@@ -1011,9 +1011,11 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
     enable_cudnn_sdp(True); enable_flash_sdp(True); enable_mem_efficient_sdp(False); enable_math_sdp(False)
     logfile = None
+    log_fh = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
+        log_fh = open(logfile, "a", encoding="utf-8")
         print(logfile)
 
     def log0(msg: str, console: bool = True) -> None:
@@ -1021,9 +1023,8 @@ def main() -> None:
             return
         if console:
             print(msg)
-        if logfile is not None:
-            with open(logfile, "a", encoding="utf-8") as f:
-                print(msg, file=f)
+        if log_fh is not None:
+            print(msg, file=log_fh, flush=True)
 
     log0(code, console=False)
     log0(f"Python {sys.version} PyTorch {torch.__version__}", console=False)
@@ -1174,8 +1175,10 @@ def main() -> None:
     _ema_param_map = dict(base_model.named_parameters())
     _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
     _ema_state_refs = [ema_state[k] for k in _ema_keys]
-    swa_state: dict[str, Tensor] | None = None
+    _swa_gpu: list[Tensor] | None = None
     swa_count = 0
+    _reached_cap_t = torch.zeros(1, dtype=torch.int32, device=device)
+    train_loss = torch.zeros((), device=device)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1222,7 +1225,7 @@ def main() -> None:
                 log0(f"loop_activated step:{step} frac:{frac_done:.3f}")
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        train_loss = torch.zeros((), device=device)
+        train_loss.zero_()
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1257,11 +1260,12 @@ def main() -> None:
             torch._foreach_mul_(_ema_state_refs, _ema_d)
             torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
             if scale < 0.5 and step % 5 == 0:
-                sd = {k: p.detach().cpu().float() for k, p in zip(_ema_keys, _ema_model_refs)}
-                if swa_state is None: swa_state, swa_count = sd, 1
+                refs_fp32 = [p.float() if p.dtype != torch.float32 else p for p in _ema_model_refs]
+                if _swa_gpu is None:
+                    _swa_gpu = [t.detach().clone() for t in refs_fp32]
                 else:
-                    for k in swa_state: swa_state[k] += sd[k]
-                    swa_count += 1
+                    torch._foreach_add_(_swa_gpu, refs_fp32)
+                swa_count += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1274,21 +1278,21 @@ def main() -> None:
             )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-        if distributed and max_wallclock_ms is not None:
-            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
-            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
-            reached_cap = bool(reached_cap_tensor.item())
+        if distributed and max_wallclock_ms is not None and approx_training_time_ms > max_wallclock_ms * 0.88:
+            _reached_cap_t.fill_(int(reached_cap))
+            dist.all_reduce(_reached_cap_t, op=dist.ReduceOp.MAX)
+            reached_cap = bool(_reached_cap_t.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
     log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
     ema_state = {k: v.cpu() for k, v in ema_state.items()}
-    if swa_state is not None and swa_count > 0:
+    if _swa_gpu is not None and swa_count > 0:
         log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
-        for k in swa_state:
-            swa_state[k] /= swa_count
-            ema_state[k] = 0.5 * ema_state[k] + 0.5 * swa_state[k]
-        del swa_state
+        torch._foreach_div_(_swa_gpu, float(swa_count))
+        for i, k in enumerate(_ema_keys):
+            ema_state[k] = 0.5 * ema_state[k] + 0.5 * _swa_gpu[i].cpu()
+        del _swa_gpu
     log0("ema: loading weights")
     base_model.load_state_dict(ema_state, strict=True)
     for module in base_model.modules():
@@ -1420,6 +1424,8 @@ def main() -> None:
         del ttt_model
     if distributed:
         dist.destroy_process_group()
+    if log_fh is not None:
+        log_fh.close()
 
 if __name__ == "__main__":
     main()
