@@ -93,6 +93,12 @@ class Hyperparameters:
     loop_end = 5
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0"))
+    rd_enable = bool(int(os.environ.get("RD_ENABLE", "0")))
+    rd_lambda_max = float(os.environ.get("RD_LAMBDA_MAX", "0.05"))
+    rd_start_frac = float(os.environ.get("RD_START_FRAC", "0.15"))
+    rd_ramp_frac = float(os.environ.get("RD_RAMP_FRAC", "0.25"))
+    rd_proxy_sample = int(os.environ.get("RD_PROXY_SAMPLE", "65536"))
+    rd_entropy_temp = float(os.environ.get("RD_ENTROPY_TEMP", "0.35"))
     ttt_chunk_tokens = 32768
     ttt_lr = 0.01
     ttt_epochs = 3
@@ -838,6 +844,39 @@ class Block(nn.Module):
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x, v
 
+def _collect_rd_params(model: nn.Module) -> list[Tensor]:
+    return [p for name, p in model.blocks.named_parameters()
+            if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
+
+def _rd_entropy_loss(rd_params: list[Tensor], temp: float, sample_size: int, step: int) -> Tensor:
+    """Differentiable surrogate for int5 entropy on sampled weights.
+    Pulls weight distribution toward low-entropy (more compressible under int5+brotli)."""
+    qmax = 15
+    device = rd_params[0].device
+    centers = torch.arange(-qmax, qmax + 1, device=device, dtype=torch.float32)
+    per_cap = max(sample_size // max(len(rd_params), 1), 256)
+    chunks: list[Tensor] = []
+    remaining = sample_size
+    for p in rd_params:
+        flat = p.view(-1)
+        if flat.numel() == 0 or remaining <= 0:
+            continue
+        take = min(per_cap, flat.numel(), remaining)
+        stride = max(flat.numel() // max(take, 1), 1)
+        offset = step % stride
+        chunks.append(flat[offset::stride][:take].float())
+        remaining -= take
+    vals = torch.cat(chunks)[:sample_size] if chunks else torch.zeros(0, device=device)
+    if vals.numel() == 0:
+        return torch.zeros((), device=device)
+    scale = vals.abs().mean().clamp_min(1e-6).detach() / 3.0
+    u = vals / scale
+    logits = -((u[:, None] - centers[None, :]) / temp).square()
+    probs = torch.softmax(logits, dim=1)
+    p_bar = probs.mean(dim=0)
+    return -(p_bar * torch.log2(p_bar + 1e-12)).sum() / 5.0
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -1179,6 +1218,10 @@ def main() -> None:
     swa_count = 0
     _reached_cap_t = torch.zeros(1, dtype=torch.int32, device=device)
     train_loss = torch.zeros((), device=device)
+    rd_params: list[Tensor] = []
+    if args.rd_enable:
+        rd_params = _collect_rd_params(base_model)
+        log0(f"rd: enabled params={sum(p.numel() for p in rd_params)} lambda_max={args.rd_lambda_max} start_frac={args.rd_start_frac}")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1226,12 +1269,18 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss.zero_()
+        lambda_rd = 0.0
+        if args.rd_enable and max_wallclock_ms:
+            rd_frac = (elapsed_ms / max_wallclock_ms - args.rd_start_frac) / max(args.rd_ramp_frac, 1e-8)
+            lambda_rd = args.rd_lambda_max * max(0.0, min(1.0, rd_frac))
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            if lambda_rd > 0.0 and micro_step == grad_accum_steps - 1 and rd_params:
+                loss = loss + lambda_rd * _rd_entropy_loss(rd_params, args.rd_entropy_temp, args.rd_proxy_sample, step)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
