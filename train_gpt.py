@@ -1145,6 +1145,9 @@ def main() -> None:
     if base_model.skip_gates.numel() > 0:
         scalar_params.append(base_model.skip_gates)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    if bool(int(os.environ.get("TIED_EMBED_LR_SQRT2", "0"))) and args.tie_embeddings:
+        token_lr = args.tied_embed_lr / (2 ** 0.5)
+        log0(f"tied_embed_lr_sqrt2: lr={token_lr:.4f} (was {args.tied_embed_lr})")
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
