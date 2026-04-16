@@ -78,7 +78,7 @@ class Hyperparameters:
     matrix_lr = 0.022
     scalar_lr = 0.025
     muon_momentum = 0.99
-    muon_backend_steps = 5
+    muon_backend_steps = 4
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 1500
     beta1 = 0.9
@@ -109,13 +109,15 @@ class Hyperparameters:
     eval_hash_buckets = 16384
     eval_hash_lr_mult = 10.0
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
-    X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
+    A = X @ X.T
+    s = (A.abs().sum(dim=-1) + eps).rsqrt()
+    X = s.unsqueeze(-1) * X
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A
