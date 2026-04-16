@@ -45,6 +45,9 @@ except ImportError:
         HAS_FA3 = False
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+_YOU_NS = [(4.0848, -6.8946, 2.9270), (3.9505, -6.3029, 2.6377), (3.7418, -5.5913, 2.3037), (2.8769, -3.1427, 1.2046), (2.8366, -3.0525, 1.2012)]
+_USE_YOU = bool(int(os.environ.get("USE_YOU_COEFFS", "0")))
+
 class Hyperparameters:
     data_path = "./data/datasets/fineweb10B_sp9000"
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -78,7 +81,7 @@ class Hyperparameters:
     matrix_lr = 0.022
     scalar_lr = 0.025
     muon_momentum = 0.99
-    muon_backend_steps = 4
+    muon_backend_steps = 5 if _USE_YOU else 4
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 1500
     beta1 = 0.9
@@ -110,18 +113,20 @@ class Hyperparameters:
     eval_hash_lr_mult = 10.0
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
-    a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    A = X @ X.T
-    s = (A.abs().sum(dim=-1) + eps).rsqrt()
-    X = s.unsqueeze(-1) * X
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+    if _USE_YOU:
+        X /= X.norm() + eps
+        for t in range(steps):
+            a, b, c = _YOU_NS[t]
+            A = X @ X.T; B = b * A + c * A @ A; X = a * X + B @ X
+    else:
+        A = X @ X.T; s = (A.abs().sum(dim=-1) + eps).rsqrt(); X = s.unsqueeze(-1) * X
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        for _ in range(steps):
+            A = X @ X.T; B = b * A + c * A @ A; X = a * X + B @ X
     return X.T if transposed else X
 
 class Muon(torch.optim.Optimizer):
@@ -785,6 +790,8 @@ class CausalSelfAttention(nn.Module):
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        if v0 is not None:
+            v = v + v0
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         q = apply_rotary_emb(q, cos, sin)
