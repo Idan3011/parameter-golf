@@ -74,8 +74,8 @@ class Hyperparameters:
     tied_embed_lr = 0.015
     tied_embed_init_std = 0.005
     matrix_lr = 0.022
-    scalar_lr = 0.025
-    muon_momentum = 0.99
+    scalar_lr = float(os.environ.get("SCALAR_LR_VALUE", "0.025"))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM_VALUE", "0.995"))
     muon_backend_steps = 5 if _USE_YOU else 4
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 1500
@@ -85,10 +85,10 @@ class Hyperparameters:
     grad_clip_norm = 0.0
     muon_wd = 0.095
     adam_wd = 0.095
-    ema_decay = 0.9965
-    num_loops = 2
-    loop_start = 4
-    loop_end = 5
+    ema_decay = float(os.environ.get("EMA_DECAY_VALUE", "0.993"))
+    num_loops = int(os.environ.get("NUM_LOOPS", "2"))
+    loop_start = int(os.environ.get("LOOP_START", "4"))
+    loop_end = int(os.environ.get("LOOP_END", "5"))
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0"))
     rd_enable = bool(int(os.environ.get("RD_ENABLE", "0")))
@@ -1130,10 +1130,11 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
     block_named_params = list(base_model.blocks.named_parameters())
     _depth_lr = bool(int(os.environ.get("DEPTH_LR", "0")))
-    _rec_blocks = {f"{args.loop_start}.", f"{args.loop_end}."}
+    _rec_idx = {str(i) for i in range(args.loop_start, args.loop_end + 1)}
+    def _is_rec(n): return n.split(".", 1)[0] in _rec_idx
     matrix_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
     if _depth_lr:
-        _rec_matrix = [p for name, p in block_named_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and any(name.startswith(rb) for rb in _rec_blocks)]
+        _rec_matrix = [p for name, p in block_named_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and _is_rec(name)]
         _nonrec_matrix = [p for p in matrix_params if not any(p is r for r in _rec_matrix)]
     scalar_params = [
         p
@@ -1161,9 +1162,9 @@ def main() -> None:
     optimizer_muon = Muon(matrix_params, lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd)
     for g in optimizer_muon.param_groups: g["base_lr"] = _mlr
     if _depth_lr:
-        _rec_set = set(id(p) for p in _rec_matrix)
-        optimizer_muon._lr_scales = [0.577 if id(p) in _rec_set else 1.0 for p in matrix_params]
-        log0(f"depth_lr: {sum(1 for s in optimizer_muon._lr_scales if s < 1)} recurrent params at 0.577x")
+        _rec_set = set(id(p) for p in _rec_matrix); _dlf = float(os.environ.get("DEPTH_LR_FACTOR", "0.85"))
+        optimizer_muon._lr_scales = [_dlf if id(p) in _rec_set else 1.0 for p in matrix_params]
+        log0(f"depth_lr: {sum(1 for s in optimizer_muon._lr_scales if s < 1)} recurrent params at {_dlf}x")
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1182,6 +1183,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum:{grad_accum_steps} FA3:{HAS_FA3}")
+    log0(f"effective_schedule len:{len(base_model.effective_indices)} idx:{base_model.effective_indices}")
     log0(f"batch:{args.train_batch_tokens} seq:{args.train_seq_len} warmup:{args.warmup_steps} wallclock:{args.max_wallclock_seconds:.0f}s")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
@@ -1319,7 +1321,6 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
-
         step += 1
         _ema_d = args.ema_decay
         with torch.no_grad():
@@ -1346,7 +1347,6 @@ def main() -> None:
             reached_cap = bool(_reached_cap_t.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
     if not _skip_train:
         log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
         ema_state = {k: v.cpu() for k, v in ema_state.items()}
