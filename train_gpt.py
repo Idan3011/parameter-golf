@@ -797,6 +797,7 @@ class CausalSelfAttention(nn.Module):
         self.use_xsa = use_xsa
         self._q_split = dim
         self._kv_split = kv_dim
+        self.attn_out_gate = nn.Parameter(torch.zeros(num_heads, 12))
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
@@ -825,6 +826,8 @@ class CausalSelfAttention(nn.Module):
             vn = F.normalize(v, dim=-1)[:, :, :, None, :]
             proj = (y_kv * vn).sum(dim=-1, keepdim=True)
             y = (y_kv - proj * vn).flatten(2, 3)
+        gate = 2.0 * torch.sigmoid(F.linear(x[:, :, :12].contiguous(), self.attn_out_gate))
+        y = y * gate.unsqueeze(-1)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y), v
 
@@ -1365,6 +1368,10 @@ def main() -> None:
         if master_process:
             torch.save(base_model.state_dict(), "final_model.float.pt")
             log0(f"saved pre-GPTQ float checkpoint: {os.path.getsize('final_model.float.pt')} bytes")
+            if getattr(base_model.blocks[0].attn, "attn_out_gate", None) is not None:
+                for _i, _blk in enumerate(base_model.blocks):
+                    _g = _blk.attn.attn_out_gate.detach().float()
+                    log0(f"attn_out_gate block{_i}: mean={_g.mean():.4f} std={_g.std():.4f} min={_g.min():.4f} max={_g.max():.4f}")
     _val_calib = None
     if bool(int(os.environ.get("VAL_CALIB", "0"))):
         rng = torch.Generator(); rng.manual_seed(args.seed)
