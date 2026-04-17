@@ -796,8 +796,7 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.use_xsa = use_xsa
         self._q_split = dim
-        self._kv_split = kv_dim
-        self.attn_out_gate = nn.Parameter(torch.zeros(num_heads, 12))
+        self._kv_split = kv_dim; self.attn_out_gate = nn.Parameter(torch.zeros(num_heads, 12))
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
@@ -902,7 +901,6 @@ def _rd_entropy_loss(rd_params: list[Tensor], temp: float, sample_size: int, ste
     probs = torch.softmax(logits, dim=1)
     p_bar = probs.mean(dim=0)
     return -(p_bar * torch.log2(p_bar + 1e-12)).sum() / 5.0
-
 
 class GPT(nn.Module):
     def __init__(
@@ -1368,10 +1366,6 @@ def main() -> None:
         if master_process:
             torch.save(base_model.state_dict(), "final_model.float.pt")
             log0(f"saved pre-GPTQ float checkpoint: {os.path.getsize('final_model.float.pt')} bytes")
-            if getattr(base_model.blocks[0].attn, "attn_out_gate", None) is not None:
-                for _i, _blk in enumerate(base_model.blocks):
-                    _g = _blk.attn.attn_out_gate.detach().float()
-                    log0(f"attn_out_gate block{_i}: mean={_g.mean():.4f} std={_g.std():.4f} min={_g.min():.4f} max={_g.max():.4f}")
     _val_calib = None
     if bool(int(os.environ.get("VAL_CALIB", "0"))):
         rng = torch.Generator(); rng.manual_seed(args.seed)
@@ -1502,6 +1496,5 @@ def main() -> None:
         dist.destroy_process_group()
     if log_fh is not None:
         log_fh.close()
-
 if __name__ == "__main__":
     main()
