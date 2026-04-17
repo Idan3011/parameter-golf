@@ -71,7 +71,7 @@ class Hyperparameters:
     logit_softcap = 30.0
     embed_lr = 0.6
     head_lr = 0.008
-    tied_embed_lr = 0.035
+    tied_embed_lr = 0.015
     tied_embed_init_std = 0.005
     matrix_lr = 0.022
     scalar_lr = 0.025
@@ -1145,9 +1145,10 @@ def main() -> None:
     if base_model.skip_gates.numel() > 0:
         scalar_params.append(base_model.skip_gates)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    if bool(int(os.environ.get("TIED_EMBED_LR_SQRT2", "0"))) and args.tie_embeddings:
-        token_lr = args.tied_embed_lr / (2 ** 0.5)
-        log0(f"tied_embed_lr_sqrt2: lr={token_lr:.4f} (was {args.tied_embed_lr})")
+    _telr = os.environ.get("TIED_EMBED_LR_VALUE", "")
+    if _telr:
+        token_lr = float(_telr)
+        log0(f"tied_embed_lr_override: lr={token_lr:.4f} (was {args.tied_embed_lr})")
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1155,8 +1156,10 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
-    optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd)
-    for g in optimizer_muon.param_groups: g["base_lr"] = args.matrix_lr
+    _mlr = float(os.environ.get("MATRIX_LR_VALUE", args.matrix_lr))
+    if _mlr != args.matrix_lr: log0(f"matrix_lr_override: lr={_mlr:.4f} (was {args.matrix_lr})")
+    optimizer_muon = Muon(matrix_params, lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd)
+    for g in optimizer_muon.param_groups: g["base_lr"] = _mlr
     if _depth_lr:
         _rec_set = set(id(p) for p in _rec_matrix)
         optimizer_muon._lr_scales = [0.577 if id(p) in _rec_set else 1.0 for p in matrix_params]
@@ -1256,7 +1259,6 @@ def main() -> None:
     while True:
         if _skip_train: break
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
@@ -1276,12 +1278,10 @@ def main() -> None:
             log0(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-
         if last_step:
             if stop_after_step is not None and step < args.iterations:
                 log0(f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms step:{step}/{args.iterations}")
             break
-
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.enable_looping_at > 0 and base_model.encoder_indices is base_model._noloop_enc:
             frac_done = elapsed_ms / max(max_wallclock_ms, 1.0) if max_wallclock_ms else step / args.iterations
@@ -1307,16 +1307,13 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
