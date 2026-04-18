@@ -1,18 +1,8 @@
 """Hard stop: train_gpt.py must never be longer than 1500 lines."""
 from __future__ import annotations
-import copy
-import glob
-import io
-import math
-import os
-import random
-import subprocess
-import sys
-import time
-import uuid
+import copy, glob, io, math, os, random, subprocess, sys, time, uuid
 from pathlib import Path
-import brotli
-import numpy as _np
+import brotli, numpy as _np
 def _byte_shuffle(data: bytes) -> bytes:
     arr = _np.frombuffer(data, dtype=_np.uint8)
     pad = (4 - len(arr) % 4) % 4
@@ -91,12 +81,6 @@ class Hyperparameters:
     loop_end = int(os.environ.get("LOOP_END", "5"))
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0"))
-    rd_enable = bool(int(os.environ.get("RD_ENABLE", "0")))
-    rd_lambda_max = float(os.environ.get("RD_LAMBDA_MAX", "0.05"))
-    rd_start_frac = float(os.environ.get("RD_START_FRAC", "0.15"))
-    rd_ramp_frac = float(os.environ.get("RD_RAMP_FRAC", "0.25"))
-    rd_proxy_sample = int(os.environ.get("RD_PROXY_SAMPLE", "65536"))
-    rd_entropy_temp = float(os.environ.get("RD_ENTROPY_TEMP", "0.35"))
     ttt_chunk_tokens = 32768
     ttt_lr = 0.01
     ttt_epochs = 3
@@ -219,25 +203,12 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
 
-def eval_val(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
+def eval_val(args: Hyperparameters, model: nn.Module, rank: int, world_size: int, device: torch.device,
+             grad_accum_steps: int, val_tokens: Tensor, base_bytes_lut: Tensor,
+             has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor) -> tuple[float, float]:
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
+        raise ValueError(f"VAL_BATCH_SIZE must provide at least one sequence per rank; got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}")
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
@@ -355,19 +326,9 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         for t in (L, T, B): dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return float((L / (B * math.log(2.0))).item())
 
-def eval_val_sliding(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    stride: int = 64,
-    batch_size: int = 256,
-) -> tuple[float, float]:
+def eval_val_sliding(args: Hyperparameters, model: nn.Module, rank: int, world_size: int, device: torch.device,
+                     val_tokens: Tensor, base_bytes_lut: Tensor, has_leading_space_lut: Tensor,
+                     is_boundary_token_lut: Tensor, stride: int = 64, batch_size: int = 256) -> tuple[float, float]:
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel()
     windows: list[tuple[int, int]] = []
@@ -485,13 +446,7 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-    obj: dict[str, object] = {
-        "__quant_format__": "int6_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
+    obj: dict[str, object] = {"__quant_format__": "int6_per_row_v1", "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
     if qmeta:
         obj["qmeta"] = qmeta
     if passthrough_orig_dtypes:
@@ -622,8 +577,7 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
 GPTQ_SD_K = 15.0
 GPTQ_CR = 31
 _PER_LAYER_Q = {}
-if os.environ.get("MIXED_QUANT_A"): _PER_LAYER_Q = {"blocks.0.attn.c_attn.weight": (127, 22.0)}
-elif os.environ.get("MIXED_QUANT_B"): _PER_LAYER_Q = {"blocks.0.attn.c_attn.weight": (127, 22.0), "blocks.9.attn.c_attn.weight": (63, 18.0), "blocks.11.attn.proj.weight": (63, 18.0), "blocks.10.attn.proj.weight": (63, 18.0), "blocks.11.mlp.fc.weight": (15, 11.0), "blocks.11.attn.c_attn.weight": (15, 11.0), "blocks.10.mlp.fc.weight": (15, 11.0), "blocks.9.mlp.fc.weight": (15, 11.0)}
+if os.environ.get("MIXED_QUANT_B"): _PER_LAYER_Q = {"blocks.0.attn.c_attn.weight": (127, 22.0), "blocks.9.attn.c_attn.weight": (63, 18.0), "blocks.11.attn.proj.weight": (63, 18.0), "blocks.10.attn.proj.weight": (63, 18.0), "blocks.11.mlp.fc.weight": (15, 11.0), "blocks.11.attn.c_attn.weight": (15, 11.0), "blocks.10.mlp.fc.weight": (15, 11.0), "blocks.9.mlp.fc.weight": (15, 11.0)}
 def _get_quant_config(name):
     return _PER_LAYER_Q.get(name, (GPTQ_CR, GPTQ_SD_K))
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print, calib_override=None) -> dict[str, Tensor]:
@@ -870,56 +824,10 @@ class Block(nn.Module):
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x, v
 
-def _collect_rd_params(model: nn.Module) -> list[Tensor]:
-    return [p for name, p in model.blocks.named_parameters()
-            if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
-
-def _rd_entropy_loss(rd_params: list[Tensor], temp: float, sample_size: int, step: int) -> Tensor:
-    """Differentiable surrogate for int5 entropy on sampled weights.
-    Pulls weight distribution toward low-entropy (more compressible under int5+brotli)."""
-    qmax = 15
-    device = rd_params[0].device
-    centers = torch.arange(-qmax, qmax + 1, device=device, dtype=torch.float32)
-    per_cap = max(sample_size // max(len(rd_params), 1), 256)
-    chunks: list[Tensor] = []
-    remaining = sample_size
-    for p in rd_params:
-        flat = p.view(-1)
-        if flat.numel() == 0 or remaining <= 0:
-            continue
-        take = min(per_cap, flat.numel(), remaining)
-        stride = max(flat.numel() // max(take, 1), 1)
-        offset = step % stride
-        chunks.append(flat[offset::stride][:take].float())
-        remaining -= take
-    vals = torch.cat(chunks)[:sample_size] if chunks else torch.zeros(0, device=device)
-    if vals.numel() == 0:
-        return torch.zeros((), device=device)
-    scale = vals.abs().mean().clamp_min(1e-6).detach() / 3.0
-    u = vals / scale
-    logits = -((u[:, None] - centers[None, :]) / temp).square()
-    probs = torch.softmax(logits, dim=1)
-    p_bar = probs.mean(dim=0)
-    return -(p_bar * torch.log2(p_bar + 1e-12)).sum() / 5.0
-
 class GPT(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        num_layers: int,
-        model_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: float,
-        tie_embeddings: bool,
-        tied_embed_init_std: float,
-        logit_softcap: float,
-        rope_base: float,
-        qk_gain_init: float,
-        num_loops: int = 2,
-        loop_start: int = 4,
-        loop_end: int = 5,
-    ):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int, num_kv_heads: int,
+                 mlp_mult: float, tie_embeddings: bool, tied_embed_init_std: float, logit_softcap: float,
+                 rope_base: float, qk_gain_init: float, num_loops: int = 2, loop_start: int = 4, loop_end: int = 5):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -951,14 +859,7 @@ class GPT(nn.Module):
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.rotary = Rotary(model_dim // num_heads, base=rope_base)
         parallel_start = 7
-        self.blocks = nn.ModuleList(
-            [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                      qk_gain_init, use_xsa=True, leaky=True,
-                      layer_idx=i, parallel_residual=(i >= parallel_start))
-                for i in range(num_layers)
-            ]
-        )
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, num_kv_heads, mlp_mult, qk_gain_init, use_xsa=True, leaky=True, layer_idx=i, parallel_residual=(i >= parallel_start)) for i in range(num_layers)])
         self.final_norm = RMSNorm()
         self.eval_hash_emb: nn.Embedding | None = None
         self.eval_hash_multiplier = 2039
@@ -1137,11 +1038,7 @@ def main() -> None:
     if _depth_lr:
         _rec_matrix = [p for name, p in block_named_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and _is_rec(name)]
         _nonrec_matrix = [p for p in matrix_params if not any(p is r for r in _rec_matrix)]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    scalar_params = [p for name, p in block_named_params if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.skip_gates.numel() > 0:
@@ -1252,10 +1149,6 @@ def main() -> None:
     swa_count = 0
     _reached_cap_t = torch.zeros(1, dtype=torch.int32, device=device)
     train_loss = torch.zeros((), device=device)
-    rd_params: list[Tensor] = []
-    if args.rd_enable:
-        rd_params = _collect_rd_params(base_model)
-        log0(f"rd: enabled params={sum(p.numel() for p in rd_params)} lambda_max={args.rd_lambda_max} start_frac={args.rd_start_frac}")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1295,18 +1188,12 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss.zero_()
-        lambda_rd = 0.0
-        if args.rd_enable and max_wallclock_ms:
-            rd_frac = (elapsed_ms / max_wallclock_ms - args.rd_start_frac) / max(args.rd_ramp_frac, 1e-8)
-            lambda_rd = args.rd_lambda_max * max(0.0, min(1.0, rd_frac))
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
-            if lambda_rd > 0.0 and micro_step == grad_accum_steps - 1 and rd_params:
-                loss = loss + lambda_rd * _rd_entropy_loss(rd_params, args.rd_entropy_temp, args.rd_proxy_sample, step)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1422,10 +1309,7 @@ def main() -> None:
         if s.ndim > 0:
             qmeta_t[name] = {"scheme": "per_row", "axis": 0}
         quant_payload += q.numel() * q.element_size() + s.numel() * s.element_size()
-    quant_obj = {
-        "__quant_format__": f"gptq_sdclip_cr{cr}_per_row_v1",
-        "quantized": quantized_t, "scales": scales_t, "dtypes": dtypes_t, "passthrough": passthrough_t,
-    }
+    quant_obj = {"__quant_format__": f"gptq_sdclip_cr{cr}_per_row_v1", "quantized": quantized_t, "scales": scales_t, "dtypes": dtypes_t, "passthrough": passthrough_t}
     if qmeta_t:
         quant_obj["qmeta"] = qmeta_t
     if passthrough_orig_dtypes_t:
