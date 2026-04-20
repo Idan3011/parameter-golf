@@ -47,7 +47,7 @@ class Hyperparameters:
     warmdown_iters = 3500
     warmup_steps = 20
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", "786432"))
-    train_seq_len = 2048
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", "2048"))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = 5.25
     vocab_size = 9000
@@ -61,11 +61,11 @@ class Hyperparameters:
     logit_softcap = 30.0
     embed_lr = 0.6
     head_lr = 0.008
-    tied_embed_lr = 0.015
+    tied_embed_lr = 0.035
     tied_embed_init_std = 0.005
     matrix_lr = 0.022
     scalar_lr = float(os.environ.get("SCALAR_LR_VALUE", "0.025"))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM_VALUE", "0.995"))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM_VALUE", "0.99"))
     muon_backend_steps = 5 if _USE_YOU else 4
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 1500
@@ -75,7 +75,7 @@ class Hyperparameters:
     grad_clip_norm = 0.0
     muon_wd = 0.095
     adam_wd = 0.095
-    ema_decay = float(os.environ.get("EMA_DECAY_VALUE", "0.993"))
+    ema_decay = float(os.environ.get("EMA_DECAY_VALUE", "0.9965"))
     num_loops = int(os.environ.get("NUM_LOOPS", "2"))
     loop_start = int(os.environ.get("LOOP_START", "4"))
     loop_end = int(os.environ.get("LOOP_END", "5"))
@@ -574,10 +574,10 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
             W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
     Q = Q[:, inv_perm]
     return (Q * sf[:, None]).to(dtype=weight.dtype)
-GPTQ_SD_K = 15.0
+GPTQ_SD_K = float(os.environ.get("GPTQ_SD_K", "15.0"))
 GPTQ_CR = 31
 _PER_LAYER_Q = {}
-if os.environ.get("MIXED_QUANT_B"): _PER_LAYER_Q = {"blocks.0.attn.c_attn.weight": (127, 22.0), "blocks.9.attn.c_attn.weight": (63, 18.0), "blocks.11.attn.proj.weight": (63, 18.0), "blocks.10.attn.proj.weight": (63, 18.0), "blocks.11.mlp.fc.weight": (15, 11.0), "blocks.11.attn.c_attn.weight": (15, 11.0), "blocks.10.mlp.fc.weight": (15, 11.0), "blocks.9.mlp.fc.weight": (15, 11.0)}
+if os.environ.get("MIXED_QUANT_B"): _PER_LAYER_Q = {"blocks.0.attn.c_attn.weight": (127, 22.0), "blocks.9.attn.c_attn.weight": (63, 18.0), "blocks.11.attn.proj.weight": (63, 18.0), "blocks.10.attn.proj.weight": (63, 18.0), "blocks.11.mlp.fc.weight": (15, 11.0), "blocks.11.attn.c_attn.weight": (15, 11.0), "blocks.10.mlp.fc.weight": (15, 11.0), "blocks.9.mlp.fc.weight": (15, 11.0), "blocks.8.mlp.fc.weight": (31, 13.0), "blocks.4.mlp.fc.weight": (31, 13.0), "blocks.2.mlp.fc.weight": (31, 13.0), "blocks.7.mlp.proj.weight": (31, 13.0)}
 def _get_quant_config(name):
     return _PER_LAYER_Q.get(name, (GPTQ_CR, GPTQ_SD_K))
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print, calib_override=None) -> dict[str, Tensor]:
@@ -744,23 +744,19 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_attn = CastedLinear(dim, dim + 2 * kv_dim, bias=False)
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.use_xsa = use_xsa
-        self._q_split = dim
-        self._kv_split = kv_dim; self.attn_out_gate = nn.Parameter(torch.zeros(num_heads, 12))
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split((self._q_split, self._kv_split, self._kv_split), dim=-1)
-        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        if v0 is not None:
-            v = v + v0
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         q = apply_rotary_emb(q, cos, sin)
@@ -779,8 +775,6 @@ class CausalSelfAttention(nn.Module):
             vn = F.normalize(v, dim=-1)[:, :, :, None, :]
             proj = (y_kv * vn).sum(dim=-1, keepdim=True)
             y = (y_kv - proj * vn).flatten(2, 3)
-        gate = 2.0 * torch.sigmoid(F.linear(x[:, :, :12].contiguous(), self.attn_out_gate))
-        y = y * gate.unsqueeze(-1)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y), v
 
@@ -1110,9 +1104,37 @@ def main() -> None:
         for module in base_model.modules():
             if isinstance(module, CastedLinear): module.float()
         restore_low_dim_params_to_fp32(base_model)
+    _prewarm_enabled = bool(int(os.environ.get("PREWARM", "1")))
     if not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0:
         base_model.encoder_indices = base_model._noloop_enc
         base_model.decoder_indices = base_model._noloop_dec
+    if not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0 and _prewarm_enabled:
+        log0("pre-warming looped compile graph (forward+backward+opt.step, 2 iters)...")
+        _t_warm = time.perf_counter()
+        _pw_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        _pw_opt_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        base_model.encoder_indices = base_model._looped_enc
+        base_model.decoder_indices = base_model._looped_dec
+        model.train()
+        for _pw_iter in range(2):
+            zero_grad_all()
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                _pw_x, _pw_y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    _pw_loss = model(_pw_x, _pw_y)
+                (_pw_loss * grad_scale).backward()
+            for opt in optimizers:
+                opt.step()
+            zero_grad_all()
+        base_model.load_state_dict(_pw_model_state, strict=True)
+        for opt, state in zip(optimizers, _pw_opt_states, strict=True):
+            opt.load_state_dict(state)
+        zero_grad_all()
+        base_model.encoder_indices = base_model._noloop_enc
+        base_model.decoder_indices = base_model._noloop_dec
+        log0(f"looped pre-warm done in {time.perf_counter()-_t_warm:.1f}s")
     if not _skip_train and args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1197,7 +1219,12 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        _mom_wc = bool(int(os.environ.get("MOM_WARMUP_WC", "0")))
+        if _mom_wc and max_wallclock_ms is not None:
+            _mom_wc_frac = float(os.environ.get("MOM_WARMUP_WC_FRAC", "0.25"))
+            frac = min((training_time_ms / max_wallclock_ms) / _mom_wc_frac, 1.0) if _mom_wc_frac > 0 else 1.0
+        else:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
@@ -1210,7 +1237,7 @@ def main() -> None:
             opt.step()
         zero_grad_all()
         step += 1
-        _ema_d = args.ema_decay
+        _ema_d = min(args.ema_decay, step / (step + 10))
         with torch.no_grad():
             torch._foreach_mul_(_ema_state_refs, _ema_d)
             torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)

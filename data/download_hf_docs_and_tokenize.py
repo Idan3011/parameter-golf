@@ -335,6 +335,7 @@ def export_shards(
     fill = 0
     split = "val"
     shards = {"val": 0, "train": 0}
+    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", "0"))
 
     def flush() -> None:
         nonlocal fill
@@ -352,7 +353,10 @@ def export_shards(
 
     batch_encode = tok.get("encode_batch")
     batch_size = SP_BATCH_SIZE if callable(batch_encode) else 1
+    truncated = False
     for texts in batched_docs_jsonl(docs_jsonl, batch_size):
+        if truncated:
+            break
         encoded_docs = batch_encode(texts) if callable(batch_encode) else [tok["encode"](text) for text in texts]
         for text, encoded in zip(texts, encoded_docs, strict=True):
             del text
@@ -360,6 +364,9 @@ def export_shards(
             if split_for_doc != split:
                 flush()
                 split = split_for_doc
+            if max_train_shards > 0 and split == "train" and shards["train"] >= max_train_shards:
+                truncated = True
+                break
 
             encoded_arr = np.asarray(encoded, dtype=np.int32)
             toks = np.empty((encoded_arr.size + 1 + int(APPEND_EOS),), dtype=np.int32)
@@ -385,12 +392,16 @@ def export_shards(
                 pos += take
                 if fill == shard_size:
                     flush()
+                    if max_train_shards > 0 and split == "train" and shards["train"] >= max_train_shards:
+                        truncated = True
+                        break
 
         if stats["docs_total"] and stats["docs_total"] % 100_000 == 0:
             print(f"{output_dir.name}: {stats['docs_total']}/{docs_total} docs", flush=True)
 
-    flush()
-    if stats["docs_total"] != docs_total:
+    if not truncated:
+        flush()
+    if not truncated and stats["docs_total"] != docs_total:
         raise ValueError(f"expected {docs_total} docs, exported {stats['docs_total']}")
     return stats
 
