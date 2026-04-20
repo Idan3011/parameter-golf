@@ -1237,7 +1237,7 @@ def main() -> None:
             opt.step()
         zero_grad_all()
         step += 1
-        _ema_d = min(args.ema_decay, step / (step + 10))
+        _ema_d = min(args.ema_decay, step / (step + 10)) if bool(int(os.environ.get("DYNAMIC_EMA", "0"))) else args.ema_decay
         with torch.no_grad():
             torch._foreach_mul_(_ema_state_refs, _ema_d)
             torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
