@@ -99,10 +99,10 @@ class Hyperparameters:
     loop_end = int(os.environ.get("LOOP_END", "5"))
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0.25"))
-    ttt_chunk_tokens = 32768
-    ttt_lr = 0.01
-    ttt_epochs = 3
-    ttt_freeze_blocks = 0
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", "32768"))
+    ttt_lr = float(os.environ.get("TTT_LR", "0.01"))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", "0"))
     ttt_score_batch = 64
     ttt_train_batch = 32
     ttt_grad_clip = 1.0
