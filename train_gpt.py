@@ -602,6 +602,15 @@ def collect_hessians(model: nn.Module, calib_seqs: list[Tensor], device: torch.d
                     hessians[pn] += x.T @ x
                 return hook_fn
             hooks.append(module.register_forward_hook(make_hook(pname)))
+    if getattr(model, "tie_embeddings", False) and hasattr(model, "tok_emb") and hasattr(model, "final_norm"):
+        emb_cols = model.tok_emb.weight.shape[1]
+        hessians["tok_emb.weight"] = torch.zeros(emb_cols, emb_cols, dtype=torch.float32, device=device)
+        def _emb_hook(mod, inp, out):
+            x = out.detach().float()
+            if x.ndim == 3:
+                x = x.reshape(-1, x.shape[-1])
+            hessians["tok_emb.weight"] += x.T @ x
+        hooks.append(model.final_norm.register_forward_hook(_emb_hook))
     model.eval()
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for seq in calib_seqs:
@@ -660,6 +669,8 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
 GPTQ_SD_K = float(os.environ.get("GPTQ_SD_K", "15.0"))
 GPTQ_CR = int(os.environ.get("GPTQ_CR", "31"))
 def _get_quant_config(name):
+    if "attn.c_k.weight" in name or name.endswith("blocks.0.mlp.fc.weight") or name.endswith("blocks.10.mlp.proj.weight"):
+        return GPTQ_CR, float(os.environ.get("OUTLIER_K", "20.0"))
     return GPTQ_CR, GPTQ_SD_K
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print, calib_override=None) -> dict[str, Tensor]:
     """GPTQ with SD-Clip scale: sf = k * std(row) / cr. Returns (scales, crs)."""
@@ -694,6 +705,18 @@ def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_
                 gptq_crs[pname] = cr
                 module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H, clip_range=cr, scale_override=sf))
             count += 1
+    if "tok_emb.weight" in hessians and hasattr(model, "tok_emb"):
+        emb_bits = int(os.environ.get("EMB_BITS", "8"))
+        emb_k = float(os.environ.get("EMB_CLIP_K", "12.85"))
+        emb_cr = (2 ** (emb_bits - 1)) - 1
+        H_emb = hessians["tok_emb.weight"]
+        with torch.no_grad():
+            w = model.tok_emb.weight.data
+            sf_emb = (emb_k * w.float().std(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
+            gptq_scales["tok_emb.weight"] = sf_emb.cpu()
+            gptq_crs["tok_emb.weight"] = emb_cr
+            model.tok_emb.weight.data.copy_(gptq_quantize_weight(w, H_emb, clip_range=emb_cr, scale_override=sf_emb))
+        count += 1
     log_fn(f"gptq: pass1 quantized {count} layers in {time.perf_counter() - t2:.1f}s, total {time.perf_counter() - t0:.1f}s")
     if bool(int(os.environ.get("TWO_PASS_GPTQ", "0"))):
         log_fn("gptq: pass2 — re-collecting Hessians from quantized model...")
@@ -1261,8 +1284,9 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    ema_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
+    ema_state = {k: v.detach().float().clone() for k, v in base_model.state_dict().items()}
     _ema_keys = list(ema_state.keys())
+    _ema_orig_dtypes = {k: v.dtype for k, v in base_model.state_dict().items()}
     _ema_param_map = dict(base_model.named_parameters())
     _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
     _ema_state_refs = [ema_state[k] for k in _ema_keys]
@@ -1339,7 +1363,8 @@ def main() -> None:
         _ema_d = min(args.ema_decay, step / (step + 10)) if bool(int(os.environ.get("DYNAMIC_EMA", "0"))) else args.ema_decay
         with torch.no_grad():
             torch._foreach_mul_(_ema_state_refs, _ema_d)
-            torch._foreach_add_(_ema_state_refs, _ema_model_refs, alpha=1.0 - _ema_d)
+            _ema_model_fp32 = [p.float() if p.dtype != torch.float32 else p for p in _ema_model_refs]
+            torch._foreach_add_(_ema_state_refs, _ema_model_fp32, alpha=1.0 - _ema_d)
             if scale < 0.5 and step % 5 == 0:
                 refs_fp32 = [p.float() if p.dtype != torch.float32 else p for p in _ema_model_refs]
                 if _swa_gpu is None:
@@ -1370,8 +1395,12 @@ def main() -> None:
             for i, k in enumerate(_ema_keys):
                 ema_state[k] = 0.5 * ema_state[k] + 0.5 * _swa_gpu[i].cpu()
             del _swa_gpu
-        log0("ema: loading weights")
-        base_model.load_state_dict(ema_state, strict=True)
+        if bool(int(os.environ.get("SKIP_EMA", "0"))):
+            log0("ema: SKIPPED (SKIP_EMA=1) — using training-time weights")
+        else:
+            log0("ema: loading weights")
+            ema_state = {k: v.to(dtype=_ema_orig_dtypes[k]) for k, v in ema_state.items()}
+            base_model.load_state_dict(ema_state, strict=True)
         for module in base_model.modules():
             if isinstance(module, CastedLinear): module.float()
         restore_low_dim_params_to_fp32(base_model)
@@ -1379,6 +1408,12 @@ def main() -> None:
         if master_process:
             torch.save(base_model.state_dict(), "final_model.float.pt")
             log0(f"saved pre-GPTQ float checkpoint: {os.path.getsize('final_model.float.pt')} bytes")
+    if bool(int(os.environ.get("PREQUANT_EVAL", "1"))):
+        torch.cuda.synchronize()
+        _t_pre = time.perf_counter()
+        _pq_loss, _pq_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+        torch.cuda.synchronize()
+        log0(f"pre-quantization post-ema val_loss:{_pq_loss:.6f} val_bpb:{_pq_bpb:.6f} eval_time:{1000.0 * (time.perf_counter() - _t_pre):.0f}ms")
     _val_calib = None
     if bool(int(os.environ.get("VAL_CALIB", "1"))) or bool(int(os.environ.get("REAL_DATA_CALIB", "0"))):
         rng = torch.Generator(); rng.manual_seed(args.seed)
@@ -1420,14 +1455,14 @@ def main() -> None:
                 passthrough_t[name] = t
             quant_payload += passthrough_t[name].numel() * passthrough_t[name].element_size()
             continue
-        if "tok_emb.weight" in name:
-            q, s = quantize_float_tensor_int6(t, bits=int(os.environ.get("EMB_BITS", "8")), sd_k=float(os.environ.get("EMB_CLIP_K", "12.85")))
-        elif name in gptq_scales:
+        if name in gptq_scales:
             sf = gptq_scales[name].float()
             t32 = t.float()
             _cr = gptq_crs.get(name, GPTQ_CR)
             q = torch.clamp(torch.round(t32 / sf[:, None]), -_cr, _cr).to(torch.int8).contiguous()
             s = sf.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        elif "tok_emb.weight" in name:
+            q, s = quantize_float_tensor_int6(t, bits=int(os.environ.get("EMB_BITS", "8")), sd_k=float(os.environ.get("EMB_CLIP_K", "12.85")))
         else:
             q, s = quantize_float_tensor_int6(t, bits=6)
         quantized_t[name] = q
@@ -1448,6 +1483,9 @@ def main() -> None:
         qsz = os.path.getsize("final_model.int6.ptz"); csz = len(code.encode("utf-8"))
         log0(f"Serialized model int6+{_COMPRESSOR}: {qsz} bytes (payload:{quant_payload} raw:{len(quant_raw)})")
         log0(f"Total submission size: {qsz + csz} bytes")
+        if bool(int(os.environ.get("SKIP_EVAL_OVERSIZE", "0"))) and (qsz + csz) > 16 * 1024 * 1024:
+            log0(f"SKIP_EVAL_OVERSIZE: artifact {qsz + csz} > 16MB, skipping val eval")
+            sys.exit(0)
     if distributed:
         dist.barrier()
 
