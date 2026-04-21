@@ -128,7 +128,7 @@ class Hyperparameters:
     run_id = str(uuid.uuid4())
     seed = 1337
     val_batch_size = 524_288
-    val_loss_every = 1000
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", "1000"))
     train_log_every = 200
     iterations = 20000
     warmdown_iters = 3500
