@@ -1,6 +1,6 @@
 """Hard stop: train_gpt.py must never be longer than 1500 lines."""
 from __future__ import annotations
-import copy, glob, io, math, os, random, subprocess, sys, time, uuid
+import base64, copy, glob, io, math, os, random, sys, time, uuid
 from pathlib import Path
 import brotli, lzma, numpy as _np
 _COMPRESSOR = os.environ.get("COMPRESSOR", "brotli")
@@ -37,75 +37,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
-_FP8_MLP = bool(int(os.environ.get("FP8_MLP", "1")))
-_FP8_SCALE_MODE = os.environ.get("FP8_SCALE_MODE", "rowwise")
-_LIGER_CE = bool(int(os.environ.get("LIGER_CE", "1")))
-if _FP8_MLP:
-    _FP8_MAX = 448.0
-    @torch.library.custom_op("paramgolf::fp8_linear_fw", mutates_args=())
-    def _fp8_linear_fw(x: Tensor, weight: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        orig_shape = x.shape
-        x2 = x.reshape(-1, x.shape[-1]).contiguous()
-        w = weight.to(dtype=x.dtype).contiguous()
-        if _FP8_SCALE_MODE == "tensorwise":
-            x_scale = (x2.float().abs().amax().clamp_min(1e-12) / _FP8_MAX).reshape(1)
-            w_scale = (w.float().abs().amax().clamp_min(1e-12) / _FP8_MAX).reshape(1)
-            sb = w_scale
-        else:
-            x_scale = x2.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / _FP8_MAX
-            w_scale = w.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / _FP8_MAX
-            sb = w_scale.t()
-        x8 = (x2.float() / x_scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-        w8 = (w.float() / w_scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-        out = torch._scaled_mm(x8, w8.t(), x_scale, sb, out_dtype=torch.bfloat16, use_fast_accum=True)
-        return out.reshape(*orig_shape[:-1], w.shape[0]), x8, w8, x_scale, w_scale
-
-    @_fp8_linear_fw.register_fake
-    def _fp8_linear_fw_fake(x, weight):
-        N_out, K_in = weight.shape[0], weight.shape[1]
-        BxS = 1
-        for d in x.shape[:-1]: BxS *= d
-        sh = (1,) if _FP8_SCALE_MODE == "tensorwise" else None
-        return (x.new_empty(x.shape[:-1] + (N_out,), dtype=torch.bfloat16),
-                x.new_empty((BxS, K_in), dtype=torch.float8_e4m3fn),
-                x.new_empty((N_out, K_in), dtype=torch.float8_e4m3fn),
-                x.new_empty(sh or (BxS, 1), dtype=torch.float32),
-                x.new_empty(sh or (N_out, 1), dtype=torch.float32))
-    def _fp8_setup_ctx(ctx, inputs, output):
-        _out, x8, w8, xs, ws = output
-        ctx.save_for_backward(x8, w8, xs, ws)
-        ctx.orig_shape = inputs[0].shape
-    def _fp8_bwd(ctx, grad_out, *_):
-        x8, w8, xs, ws = ctx.saved_tensors
-        w_bf = (w8.float() * ws).to(torch.bfloat16)
-        x_bf = (x8.float() * xs).to(torch.bfloat16)
-        g2 = grad_out.reshape(-1, grad_out.shape[-1]).to(torch.bfloat16)
-        return (g2 @ w_bf).reshape(ctx.orig_shape), g2.t() @ x_bf
-    _fp8_linear_fw.register_autograd(_fp8_bwd, setup_context=_fp8_setup_ctx)
-    def _fp8_linear(x: Tensor, weight: Tensor) -> Tensor:
-        return torch.ops.paramgolf.fp8_linear_fw(x, weight)[0]
-if _LIGER_CE:
-    import torch.distributed.tensor
-    from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
-    @torch.library.custom_op("paramgolf::liger_fused_ce_fw", mutates_args=())
-    def _liger_fused_ce_fw(x: Tensor, w: Tensor, t: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        x_rg = x.detach().requires_grad_(True)
-        w_rg = w.detach().requires_grad_(True)
-        loss, _z, _acc, gx, gw, _gb = fused_linear_cross_entropy_forward(_input=x_rg, weight=w_rg, target=t)
-        if gx is None: gx = torch.zeros_like(x)
-        if gw is None: gw = torch.zeros_like(w)
-        return loss, gx, gw
-    @_liger_fused_ce_fw.register_fake
-    def _liger_fused_ce_fw_fake(x, w, t):
-        return x.new_empty((), dtype=torch.float32), torch.empty_like(x), torch.empty_like(w)
-    def _liger_setup_ctx(ctx, inputs, output):
-        _loss, gx, gw = output
-        ctx.save_for_backward(gx, gw)
-    def _liger_bwd(ctx, grad_loss, *_):
-        gx, gw = ctx.saved_tensors
-        return gx * grad_loss, gw * grad_loss, None
-
-    _liger_fused_ce_fw.register_autograd(_liger_bwd, setup_context=_liger_setup_ctx)
 try:
     from flash_attn_interface import flash_attn_func
     HAS_FA3 = True
@@ -903,15 +834,9 @@ class MLP(nn.Module):
         self._leaky = leaky
 
     def forward(self, x: Tensor) -> Tensor:
-        if _FP8_MLP:
-            fc_out = _fp8_linear(x, self.fc.weight)
-        else:
-            fc_out = self.fc(x)
+        fc_out = self.fc(x)
         x = F.leaky_relu(fc_out, 0.5) if self._leaky else torch.relu(fc_out)
-        x_sq = x.square()
-        if _FP8_MLP:
-            return _fp8_linear(x_sq, self.proj.weight)
-        return self.proj(x_sq)
+        return self.proj(x.square())
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
@@ -1042,14 +967,6 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self._run_blocks(x, x)
         x = self.final_norm(x)
-        if target_ids is not None and _LIGER_CE:
-            weight = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
-            loss, _, _ = torch.ops.paramgolf.liger_fused_ce_fw(
-                x.reshape(-1, x.size(-1)),
-                weight,
-                target_ids.reshape(-1),
-            )
-            return loss
         logits = self._compute_logits(x)
         if target_ids is None:
             return logits
@@ -1158,8 +1075,6 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear): module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if _FP8_MLP:
-        log0(f"fp8_mlp: enabled — MLP fc/proj will use torch._scaled_mm ({_FP8_SCALE_MODE} scaling). Hopper sm_90+ required for rowwise.")
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
     block_named_params = list(base_model.blocks.named_parameters())
@@ -1480,11 +1395,22 @@ def main() -> None:
     quant_blob = _compress(quant_raw)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f: f.write(quant_blob)
-        qsz = os.path.getsize("final_model.int6.ptz"); csz = len(code.encode("utf-8"))
+        qsz = os.path.getsize("final_model.int6.ptz")
+        code_bytes = code.encode("utf-8")
+        csz_raw = len(code_bytes)
+        _code_lzma = lzma.compress(code_bytes, preset=9 | lzma.PRESET_EXTREME, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2}])
+        _code_b85 = base64.b85encode(_code_lzma)
+        _stub = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode(""),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))'
+        csz_submission = len(_code_b85) + len(_stub)
+        if os.environ.get("WRITE_COMPRESSED_SUBMISSION", "1") == "1":
+            _wrapper = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode(' + _code_b85 + b'),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))'
+            with open("submission.py", "wb") as f: f.write(_wrapper)
         log0(f"Serialized model int6+{_COMPRESSOR}: {qsz} bytes (payload:{quant_payload} raw:{len(quant_raw)})")
-        log0(f"Total submission size: {qsz + csz} bytes")
-        if bool(int(os.environ.get("SKIP_EVAL_OVERSIZE", "0"))) and (qsz + csz) > 16 * 1024 * 1024:
-            log0(f"SKIP_EVAL_OVERSIZE: artifact {qsz + csz} > 16MB, skipping val eval")
+        log0(f"code: raw={csz_raw} compressed={csz_submission} (ratio={csz_submission/csz_raw:.2f})")
+        log0(f"Total submission size (raw code): {qsz + csz_raw} bytes")
+        log0(f"Total submission size (compressed code): {qsz + csz_submission} bytes")
+        if bool(int(os.environ.get("SKIP_EVAL_OVERSIZE", "0"))) and (qsz + csz_submission) > 16 * 1024 * 1024:
+            log0(f"SKIP_EVAL_OVERSIZE: artifact {qsz + csz_submission} > 16MB, skipping val eval")
             sys.exit(0)
     if distributed:
         dist.barrier()
