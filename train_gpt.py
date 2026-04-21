@@ -1032,16 +1032,18 @@ class GPT(nn.Module):
             return logits
         return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
 
-def _ensure_sp9000_data() -> None:
-    if os.path.exists("./data/tokenizers/fineweb_9000_bpe.model") and len(glob.glob("./data/datasets/fineweb10B_sp9000/fineweb_train_*.bin")) > 0:
+def _ensure_sp_data(vocab_size: int) -> None:
+    tok_path = f"./data/tokenizers/fineweb_{vocab_size}_bpe.model"
+    data_dir = f"./data/datasets/fineweb10B_sp{vocab_size}"
+    if os.path.exists(tok_path) and len(glob.glob(f"{data_dir}/fineweb_train_*.bin")) > 0:
         return
     from huggingface_hub import snapshot_download
     import shutil
-    REPO = "Idan3011/parameter-golf-sp9000"
-    print("  downloading sp9000 data from HF (bulk)...", flush=True)
+    REPO = f"Idan3011/parameter-golf-sp{vocab_size}"
+    print(f"  downloading sp{vocab_size} data from HF ({REPO})...", flush=True)
     cache_dir = snapshot_download(REPO, repo_type="dataset", allow_patterns=["*.bin", "*.model", "*.vocab"])
     os.makedirs("data/tokenizers", exist_ok=True)
-    os.makedirs("data/datasets/fineweb10B_sp9000", exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
     for root, _, files in os.walk(cache_dir):
         for fname in files:
             if not (fname.endswith(".bin") or fname.endswith(".model") or fname.endswith(".vocab")):
@@ -1050,7 +1052,7 @@ def _ensure_sp9000_data() -> None:
             if "tokenizers" in root:
                 dst = os.path.join("data/tokenizers", fname)
             elif "datasets" in root:
-                dst = os.path.join("data/datasets/fineweb10B_sp9000", fname)
+                dst = os.path.join(data_dir, fname)
             else:
                 continue
             if os.path.exists(dst):
@@ -1062,7 +1064,7 @@ def _ensure_sp9000_data() -> None:
 def main() -> None:
     global zeropower_via_newtonschulz5
     if int(os.environ.get("RANK", "0")) == 0:
-        _ensure_sp9000_data()
+        _ensure_sp_data(int(os.environ.get("VOCAB_SIZE", "9000")))
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
