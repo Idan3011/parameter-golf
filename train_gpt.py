@@ -1398,7 +1398,7 @@ def main() -> None:
         qsz = os.path.getsize("final_model.int6.ptz")
         code_bytes = code.encode("utf-8")
         csz_raw = len(code_bytes)
-        _code_lzma = lzma.compress(code_bytes, preset=9 | lzma.PRESET_EXTREME, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2}])
+        _code_lzma = lzma.compress(code_bytes, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME}])
         _code_b85 = base64.b85encode(_code_lzma)
         _stub = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode(""),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))'
         csz_submission = len(_code_b85) + len(_stub)
