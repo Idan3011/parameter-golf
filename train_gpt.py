@@ -600,8 +600,8 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
 GPTQ_SD_K = float(os.environ.get("GPTQ_SD_K", "15.0"))
 GPTQ_CR = int(os.environ.get("GPTQ_CR", "31"))
 def _get_quant_config(name):
-    if "attn.c_k.weight" in name or name.endswith("blocks.0.mlp.fc.weight") or name.endswith("blocks.10.mlp.proj.weight"):
-        return GPTQ_CR, float(os.environ.get("OUTLIER_K", "20.0"))
+    if "attn.c_k.weight" in name or ".mlp.proj.weight" in name or name.endswith("blocks.0.mlp.fc.weight"):
+        return GPTQ_CR, float(os.environ.get("OUTLIER_K", "18.0"))
     return GPTQ_CR, GPTQ_SD_K
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print, calib_override=None) -> dict[str, Tensor]:
     """GPTQ with SD-Clip scale: sf = k * std(row) / cr. Returns (scales, crs)."""
@@ -631,7 +631,10 @@ def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_
                 continue
             cr, k = _get_quant_config(pname)
             with torch.no_grad():
-                sf = (k * module.weight.data.float().std(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                if bool(int(os.environ.get("ABSMAX_SCALE", "0"))):
+                    sf = (module.weight.data.float().abs().amax(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                else:
+                    sf = (k * module.weight.data.float().std(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
                 gptq_scales[pname] = sf.cpu()
                 gptq_crs[pname] = cr
                 module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H, clip_range=cr, scale_override=sf))
@@ -643,7 +646,10 @@ def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_
         H_emb = hessians["tok_emb.weight"]
         with torch.no_grad():
             w = model.tok_emb.weight.data
-            sf_emb = (emb_k * w.float().std(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
+            if bool(int(os.environ.get("ABSMAX_SCALE", "0"))):
+                sf_emb = (w.float().abs().amax(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
+            else:
+                sf_emb = (emb_k * w.float().std(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
             gptq_scales["tok_emb.weight"] = sf_emb.cpu()
             gptq_crs["tok_emb.weight"] = emb_cr
             model.tok_emb.weight.data.copy_(gptq_quantize_weight(w, H_emb, clip_range=emb_cr, scale_override=sf_emb))
@@ -662,7 +668,10 @@ def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_
                 if H2 is None: continue
                 cr, k = _get_quant_config(pname)
                 try:
-                    sf = (k * module.weight.data.float().std(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                    if bool(int(os.environ.get("ABSMAX_SCALE", "0"))):
+                        sf = (module.weight.data.float().abs().amax(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                    else:
+                        sf = (k * module.weight.data.float().std(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
                     gptq_scales[pname] = sf.cpu()
                     module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H2, clip_range=cr, scale_override=sf))
                 except torch._C._LinAlgError:
@@ -1135,7 +1144,7 @@ def main() -> None:
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
-        warmdown_frac = 0.72
+        warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", "0.72"))
         return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
     _skip_train = bool(int(os.environ.get("SKIP_TRAIN", "0")))
     _load_float_pt = os.environ.get("LOAD_FLOAT_PT", "")
