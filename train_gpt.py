@@ -1519,31 +1519,39 @@ def main() -> None:
     elif not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0:
         base_model.encoder_indices = base_model._noloop_enc
         base_model.decoder_indices = base_model._noloop_dec
-    if not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0 and _prewarm_enabled:
-        log0("pre-warming looped compile graph (forward+backward+opt.step, 2 iters)...")
+    if not _skip_train and _prewarm_enabled and args.num_loops > 0 and (_curriculum_phases or args.enable_looping_at > 0):
+        if _curriculum_phases:
+            _phase_nls_to_warm = sorted(set([0] + [_nl for _, _nl in _curriculum_phases]))
+        else:
+            _phase_nls_to_warm = [args.num_loops]
+        log0(f"pre-warming compile graphs for num_loops={_phase_nls_to_warm} (2 iters each)...")
         _t_warm = time.perf_counter()
         _pw_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         _pw_opt_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        base_model.encoder_indices = base_model._looped_enc
-        base_model.decoder_indices = base_model._looped_dec
-        model.train()
-        for _pw_iter in range(2):
-            zero_grad_all()
-            for micro_step in range(grad_accum_steps):
-                if distributed:
-                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                _pw_x, _pw_y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    _pw_loss = model(_pw_x, _pw_y)
-                (_pw_loss * grad_scale).backward()
-            for opt in optimizers: opt.step()
-            zero_grad_all()
+        for _phase_nl in _phase_nls_to_warm:
+            base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[_phase_nl]
+            log0(f"  prewarm num_loops={_phase_nl} encoder_len={len(base_model.encoder_indices)} decoder_len={len(base_model.decoder_indices)}")
+            model.train()
+            for _pw_iter in range(2):
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    if distributed:
+                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                    _pw_x, _pw_y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        _pw_loss = model(_pw_x, _pw_y)
+                    (_pw_loss * grad_scale).backward()
+                for opt in optimizers: opt.step()
+                zero_grad_all()
         base_model.load_state_dict(_pw_model_state, strict=True)
         for opt, state in zip(optimizers, _pw_opt_states, strict=True): opt.load_state_dict(state)
         zero_grad_all()
-        base_model.encoder_indices = base_model._noloop_enc
-        base_model.decoder_indices = base_model._noloop_dec
-        log0(f"looped pre-warm done in {time.perf_counter()-_t_warm:.1f}s")
+        if _curriculum_phases:
+            base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[0]
+        else:
+            base_model.encoder_indices = base_model._noloop_enc
+            base_model.decoder_indices = base_model._noloop_dec
+        log0(f"prewarm done in {time.perf_counter()-_t_warm:.1f}s")
     if not _skip_train and args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
