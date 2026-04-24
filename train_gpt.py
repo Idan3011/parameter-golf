@@ -36,6 +36,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+torch._dynamo.config.cache_size_limit = int(os.environ.get("DYNAMO_CACHE_SIZE", "64"))
 from torch import Tensor, nn
 try:
     from flash_attn_interface import flash_attn_func
