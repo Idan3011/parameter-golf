@@ -108,7 +108,7 @@ class Hyperparameters:
     adam_eps = 1e-8
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", "0.3"))
     muon_wd = 0.095
-    adam_wd = 0.095
+    adam_wd = float(os.environ.get("ADAM_WD", "0.095"))
     ema_decay = float(os.environ.get("EMA_DECAY_VALUE", "0.9965"))
     num_loops = int(os.environ.get("NUM_LOOPS", "2"))
     loop_start = int(os.environ.get("LOOP_START", "4"))
@@ -116,14 +116,18 @@ class Hyperparameters:
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0.25"))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", "32768"))
-    ttt_lr = float(os.environ.get("TTT_LR", "0.01"))
+    ttt_lr = float(os.environ.get("TTT_LR", "0.001"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", "0"))
-    ttt_score_batch = 64
-    ttt_train_batch = 32
+    ttt_score_batch = int(os.environ.get("TTT_SCORE_BATCH", "64"))
+    ttt_train_batch = int(os.environ.get("TTT_TRAIN_BATCH", "32"))
     ttt_grad_clip = 1.0
-    eval_hash_buckets = 16384
-    eval_hash_lr_mult = 10.0
+    eval_hash_buckets = int(os.environ.get("EVAL_HASH_BUCKETS", "16384"))
+    eval_hash_lr_mult = float(os.environ.get("EVAL_HASH_LR_MULT", "10.0"))
+    lora_ttt = bool(int(os.environ.get("LORA_TTT", "1")))
+    lora_rank = int(os.environ.get("LORA_RANK", "32"))
+    lora_alpha = float(os.environ.get("LORA_ALPHA", "64.0"))
+    lora_wd = float(os.environ.get("LORA_WD", "0.01"))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
     X = G.bfloat16()
@@ -314,13 +318,22 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         ws += stride
     L, T, B = (torch.zeros((), device=device, dtype=torch.float64) for _ in range(3))
     _fr = lambda n: any(f"blocks.{bi}." in n for bi in range(min(freeze_n, len(base_model.blocks))))
-    base_params = [p for n, p in base_model.named_parameters() if not _fr(n) and "eval_hash_emb" not in n]
     hash_params = list(base_model.eval_hash_emb.parameters()) if base_model.eval_hash_emb is not None else []
-    param_groups = [{"params": base_params, "lr": ttt_lr}]
-    if hash_params:
-        param_groups.append({"params": hash_params, "lr": ttt_lr * args.eval_hash_lr_mult})
-    ttt_params = base_params + hash_params
-    opt = torch.optim.SGD(param_groups, momentum=0.9)
+    if args.lora_ttt:
+        lora_params = [p for n, p in base_model.named_parameters() if "lora_" in n and not _fr(n) and p.requires_grad]
+        param_groups = [{"params": lora_params, "lr": ttt_lr}]
+        if hash_params:
+            param_groups.append({"params": hash_params, "lr": ttt_lr * args.eval_hash_lr_mult})
+        ttt_params = lora_params + hash_params
+        opt = torch.optim.SGD(param_groups, momentum=0.9)
+    else:
+        base_params = [p for n, p in base_model.named_parameters() if not _fr(n) and "eval_hash_emb" not in n and "lora_" not in n]
+        param_groups = [{"params": base_params, "lr": ttt_lr}]
+        if hash_params:
+            param_groups.append({"params": hash_params, "lr": ttt_lr * args.eval_hash_lr_mult})
+        ttt_params = base_params + hash_params
+        opt = torch.optim.SGD(param_groups, momentum=0.9)
+    for pg in opt.param_groups: pg['_base_lr'] = pg['lr']
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
@@ -344,8 +357,8 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
             chunk_end = min((ci + 1) * chunk_tok, total_tokens)
             chunk_seqs = (chunk_end - chunk_start) // S
             if chunk_seqs > 0:
-                cos_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in opt.param_groups: pg['lr'] = cos_lr
+                cos_scale = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in opt.param_groups: pg['lr'] = pg['_base_lr'] * cos_scale
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 for _ in range(ttt_epochs):
@@ -1007,6 +1020,35 @@ def _refresh_newton_muon_preconditioners(model: nn.Module) -> None:
         if skipped:
             print(f"newton_muon: refresh ok={ok} skipped={skipped} (singular grams)", flush=True)
 
+class LoRACastedLinear(CastedLinear):
+    def __init__(self, base: "CastedLinear", rank: int, alpha: float):
+        nn.Linear.__init__(self, base.in_features, base.out_features, bias=(base.bias is not None))
+        self.weight = base.weight
+        if base.bias is not None:
+            self.bias = base.bias
+        self.lora_A = nn.Parameter(torch.empty(rank, base.in_features, dtype=torch.float32))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=torch.float32))
+        self.lora_scale = alpha / rank
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x: Tensor) -> Tensor:
+        base_out = F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
+        lora_out = (x @ self.lora_A.T.to(x.dtype)) @ self.lora_B.T.to(x.dtype) * self.lora_scale
+        return base_out + lora_out
+
+def inject_lora_adapters(model: nn.Module, rank: int, alpha: float) -> int:
+    count = 0
+    for parent in list(model.modules()):
+        for name, child in list(parent.named_children()):
+            if type(child) is CastedLinear:
+                device = child.weight.device
+                new = LoRACastedLinear(child, rank, alpha)
+                new.lora_A.data = new.lora_A.data.to(device=device)
+                new.lora_B.data = new.lora_B.data.to(device=device)
+                setattr(parent, name, new)
+                count += 1
+    return count
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
@@ -1197,6 +1239,15 @@ class GPT(nn.Module):
         noloop = list(range(num_layers))
         self._noloop_enc = noloop[: len(noloop) // 2]
         self._noloop_dec = noloop[len(noloop) // 2 :]
+        self._phase_indices: dict[int, tuple[list[int], list[int]]] = {0: (self._noloop_enc, self._noloop_dec)}
+        for _nl in range(1, num_loops + 1):
+            _seg = list(range(loop_start, loop_end + 1))
+            _idx = list(range(loop_start))
+            for _ in range(_nl + 1):
+                _idx.extend(_seg)
+            _idx.extend(range(loop_end + 1, num_layers))
+            _half = len(_idx) // 2
+            self._phase_indices[_nl] = (_idx[:_half], _idx[_half:])
         self.encoder_indices = self._looped_enc
         self.decoder_indices = self._looped_dec
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
@@ -1241,6 +1292,7 @@ class GPT(nn.Module):
         else:
             skip_w_cast = None
             skip_g_cast = None
+        _skip_lerp = bool(int(os.environ.get("SKIP_LERP", "1")))
         for dec_step, block_idx in enumerate(self.decoder_indices):
             if dec_step < self.num_skip_weights and skips:
                 if skip_w_cast is not None:
@@ -1249,7 +1301,10 @@ class GPT(nn.Module):
                 else:
                     skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
                     gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
-                x = x + gate * skip
+                if _skip_lerp:
+                    x = torch.lerp(skip, x, gate)
+                else:
+                    x = x + gate * skip
             x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
         return x
 
@@ -1450,7 +1505,18 @@ def main() -> None:
             if isinstance(module, CastedLinear): module.float()
         restore_low_dim_params_to_fp32(base_model)
     _prewarm_enabled = bool(int(os.environ.get("PREWARM", "1")))
-    if not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0:
+    _curriculum_str = os.environ.get("CURRICULUM_PHASES", "").strip()
+    _curriculum_phases: list[tuple[float, int]] = []
+    if _curriculum_str:
+        for _part in _curriculum_str.split(","):
+            _f, _n = _part.strip().split(":")
+            _curriculum_phases.append((float(_f), int(_n)))
+        _curriculum_phases.sort()
+        log0(f"curriculum: phases={_curriculum_phases} (num_loops=0 before first phase)")
+    _current_phase_nl = 0
+    if not _skip_train and _curriculum_phases:
+        base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[0]
+    elif not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0:
         base_model.encoder_indices = base_model._noloop_enc
         base_model.decoder_indices = base_model._noloop_dec
     if not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0 and _prewarm_enabled:
@@ -1541,8 +1607,17 @@ def main() -> None:
                 log0(f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms step:{step}/{args.iterations}")
             break
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        if args.enable_looping_at > 0 and base_model.encoder_indices is base_model._noloop_enc:
-            frac_done = elapsed_ms / max(max_wallclock_ms, 1.0) if max_wallclock_ms else step / args.iterations
+        frac_done = elapsed_ms / max(max_wallclock_ms, 1.0) if max_wallclock_ms else step / args.iterations
+        if _curriculum_phases:
+            target_nl = 0
+            for (_f_th, _nl) in _curriculum_phases:
+                if frac_done >= _f_th:
+                    target_nl = _nl
+            if target_nl != _current_phase_nl:
+                base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[target_nl]
+                log0(f"curriculum step:{step} frac:{frac_done:.3f} num_loops {_current_phase_nl}->{target_nl}")
+                _current_phase_nl = target_nl
+        elif args.enable_looping_at > 0 and base_model.encoder_indices is base_model._noloop_enc:
             if frac_done >= args.enable_looping_at:
                 base_model.encoder_indices = base_model._looped_enc
                 base_model.decoder_indices = base_model._looped_dec
@@ -1785,12 +1860,27 @@ def main() -> None:
             if isinstance(m, CastedLinear): m.float()  # fp32 matrix params
         restore_low_dim_params_to_fp32(ttt_model)
         ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
-        ttt_model.eval_hash_emb = nn.Embedding(args.eval_hash_buckets, args.model_dim).to(device)
-        nn.init.zeros_(ttt_model.eval_hash_emb.weight)
-        log0(f"ttt: hash_emb attached ({args.eval_hash_buckets} buckets, lr_mult={args.eval_hash_lr_mult})")
+        if args.eval_hash_buckets > 0:
+            ttt_model.eval_hash_emb = nn.Embedding(args.eval_hash_buckets, args.model_dim).to(device)
+            nn.init.zeros_(ttt_model.eval_hash_emb.weight)
+            log0(f"ttt: hash_emb attached ({args.eval_hash_buckets} buckets, lr_mult={args.eval_hash_lr_mult})")
+        else:
+            log0("ttt: hash_emb SKIPPED (EVAL_HASH_BUCKETS=0)")
+        if args.lora_ttt:
+            n_inject = inject_lora_adapters(ttt_model, args.lora_rank, args.lora_alpha)
+            for p in ttt_model.parameters(): p.requires_grad = False
+            for n, p in ttt_model.named_parameters():
+                if "lora_" in n: p.requires_grad = True
+            if ttt_model.eval_hash_emb is not None:
+                for p in ttt_model.eval_hash_emb.parameters(): p.requires_grad = True
+            n_lora_params = sum(p.numel() for n, p in ttt_model.named_parameters() if "lora_" in n)
+            log0(f"ttt: LoRA injected into {n_inject} CastedLinear modules (rank={args.lora_rank}, alpha={args.lora_alpha}, wd={args.lora_wd}, {n_lora_params/1e6:.2f}M lora params)")
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
-        ttt_model = torch.compile(ttt_model)
+        if bool(int(os.environ.get("SKIP_TTT_COMPILE", "1"))):
+            log0("ttt: torch.compile SKIPPED (SKIP_TTT_COMPILE=1)")
+        else:
+            ttt_model = torch.compile(ttt_model)
         log0("ttt: starting")
         ttt_bpb = eval_val_ttt(args, ttt_model, rank, world_size, device, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, log_fn=log0)
         torch.cuda.synchronize()
