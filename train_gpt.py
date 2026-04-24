@@ -49,6 +49,22 @@ except ImportError:
 from torch.nn.parallel import DistributedDataParallel as DDP
 _YOU_NS = [(4.0848, -6.8946, 2.9270), (3.9505, -6.3029, 2.6377), (3.7418, -5.5913, 2.3037), (2.8769, -3.1427, 1.2046), (2.8366, -3.0525, 1.2012)]
 _USE_YOU = bool(int(os.environ.get("USE_YOU_COEFFS", "0")))
+_HOIST_SKIP_GATE = bool(int(os.environ.get("HOIST_SKIP_GATE", "0")))
+_ADAPTIVE_K = bool(int(os.environ.get("ADAPTIVE_K", "0")))
+_ADAPTIVE_K_CANDIDATES = (10.0, 12.85, 15.0, 18.0, 22.0)
+_ADAPTIVE_K_ENTROPY_CAP = float(os.environ.get("ADAPTIVE_K_ENTROPY_CAP", "4.0"))
+_QKV_FUSED = bool(int(os.environ.get("QKV_FUSED", "0")))
+_WTE_RANK1 = bool(int(os.environ.get("WTE_RANK1", "1")))
+_RECUR_INT7 = bool(int(os.environ.get("RECUR_INT7", "0")))
+_NEWTON_MUON = bool(int(os.environ.get("NEWTON_MUON", "0")))
+_NEWTON_MUON_REFRESH = int(os.environ.get("NEWTON_MUON_REFRESH", "20"))
+_NEWTON_MUON_EMA = float(os.environ.get("NEWTON_MUON_EMA", "0.95"))
+_NEWTON_MUON_SAMPLE = int(os.environ.get("NEWTON_MUON_SAMPLE", "1024"))
+_NEWTON_MUON_WARMUP = int(os.environ.get("NEWTON_MUON_WARMUP", "50"))
+_newton_muon_inv: dict[int, Tensor] = {}
+_RHT_V = bool(int(os.environ.get("RHT_V", "0")))
+_RHT_SEED = int(os.environ.get("RHT_SEED", "1337"))
+_RESID_FUSE = bool(int(os.environ.get("RESID_FUSE", "0")))
 
 class Hyperparameters:
     _vs = int(os.environ.get("VOCAB_SIZE", "9000"))
@@ -84,7 +100,7 @@ class Hyperparameters:
     matrix_lr = 0.022
     scalar_lr = float(os.environ.get("SCALAR_LR_VALUE", "0.025"))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM_VALUE", "0.99"))
-    muon_backend_steps = 5 if _USE_YOU else 4
+    muon_backend_steps = int(os.environ.get("MUON_NS_STEPS", "5" if _USE_YOU else "4"))
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 1500
     beta1 = 0.9
@@ -181,6 +197,10 @@ class Muon(torch.optim.Optimizer):
                     if nesterov: g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    if _NEWTON_MUON:
+                        _inv = _newton_muon_inv.get(id(p))
+                        if _inv is not None:
+                            g = g @ _inv.to(dtype=g.dtype)
                     if self._lr_scales is not None: g *= self._lr_scales[i]
                     self._updates_flat[curr : param_end] = g.reshape(-1)
                 curr = param_end
@@ -476,11 +496,76 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
+_BITPACK = bool(int(os.environ.get("BITPACK", "0")))
+
+def _bitpack_int(q_int8: Tensor, cr: int) -> tuple[Tensor, int, tuple]:
+    """Pack int8 tensor (values in [-cr, cr]) into a tight bit stream (uint8 tensor).
+    Only supports int6 (cr=31) and int7 (cr=63). Returns (packed, n_original, orig_shape)."""
+    orig_shape = tuple(q_int8.shape)
+    n = q_int8.numel()
+    if cr == 31:
+        group_size, packed_size = 4, 3
+    elif cr == 63:
+        group_size, packed_size = 8, 7
+    else:
+        return q_int8, -1, orig_shape
+    u = (q_int8.reshape(-1).to(torch.int32) + cr).to(torch.uint8)
+    pad = (group_size - n % group_size) % group_size
+    if pad > 0:
+        u = torch.cat([u, torch.zeros(pad, dtype=torch.uint8, device=u.device)])
+    g = u.view(-1, group_size)
+    if cr == 31:
+        b0 = g[:, 0] | ((g[:, 1] & 0x03) << 6)
+        b1 = (g[:, 1] >> 2) | ((g[:, 2] & 0x0F) << 4)
+        b2 = (g[:, 2] >> 4) | (g[:, 3] << 2)
+        packed = torch.stack([b0, b1, b2], dim=-1).reshape(-1).contiguous()
+    else:  # cr == 63
+        b0 = g[:, 0] | ((g[:, 1] & 0x01) << 7)
+        b1 = (g[:, 1] >> 1) | ((g[:, 2] & 0x03) << 6)
+        b2 = (g[:, 2] >> 2) | ((g[:, 3] & 0x07) << 5)
+        b3 = (g[:, 3] >> 3) | ((g[:, 4] & 0x0F) << 4)
+        b4 = (g[:, 4] >> 4) | ((g[:, 5] & 0x1F) << 3)
+        b5 = (g[:, 5] >> 5) | ((g[:, 6] & 0x3F) << 2)
+        b6 = (g[:, 6] >> 6) | ((g[:, 7] & 0x7F) << 1)
+        packed = torch.stack([b0, b1, b2, b3, b4, b5, b6], dim=-1).reshape(-1).contiguous()
+    return packed, n, orig_shape
+
+def _bitunpack_int(packed: Tensor, cr: int, n_original: int, orig_shape: tuple) -> Tensor:
+    if cr == 31:
+        group_size, packed_size = 4, 3
+    elif cr == 63:
+        group_size, packed_size = 8, 7
+    else:
+        return packed.view(orig_shape)
+    p = packed.reshape(-1, packed_size)
+    if cr == 31:
+        v0 = p[:, 0] & 0x3F
+        v1 = ((p[:, 0] >> 6) & 0x03) | ((p[:, 1] & 0x0F) << 2)
+        v2 = ((p[:, 1] >> 4) & 0x0F) | ((p[:, 2] & 0x03) << 4)
+        v3 = (p[:, 2] >> 2) & 0x3F
+        u = torch.stack([v0, v1, v2, v3], dim=-1).reshape(-1)
+    else:  # cr == 63
+        v0 = p[:, 0] & 0x7F
+        v1 = ((p[:, 0] >> 7) & 0x01) | ((p[:, 1] & 0x3F) << 1)
+        v2 = ((p[:, 1] >> 6) & 0x03) | ((p[:, 2] & 0x1F) << 2)
+        v3 = ((p[:, 2] >> 5) & 0x07) | ((p[:, 3] & 0x0F) << 3)
+        v4 = ((p[:, 3] >> 4) & 0x0F) | ((p[:, 4] & 0x07) << 4)
+        v5 = ((p[:, 4] >> 3) & 0x1F) | ((p[:, 5] & 0x03) << 5)
+        v6 = ((p[:, 5] >> 2) & 0x3F) | ((p[:, 6] & 0x01) << 6)
+        v7 = (p[:, 6] >> 1) & 0x7F
+        u = torch.stack([v0, v1, v2, v3, v4, v5, v6, v7], dim=-1).reshape(-1)
+    u = u[:n_original]
+    q = u.to(torch.int32) - cr
+    return q.to(torch.int8).view(orig_shape)
+
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
+        qm = qmeta.get(name, {})
+        if qm.get("bitpacked"):
+            q = _bitunpack_int(q, qm["cr"], qm["n_original"], tuple(qm["orig_shape"]))
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
@@ -495,6 +580,11 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         if isinstance(orig_dtype, str):
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
+    if "tok_emb_rank1_u" in out and "tok_emb_rank1_v" in out and "tok_emb.weight" in out:
+        u = out.pop("tok_emb_rank1_u").float()
+        v = out.pop("tok_emb_rank1_v").float()
+        target_dtype = out["tok_emb.weight"].dtype
+        out["tok_emb.weight"] = (out["tok_emb.weight"].float() + u[:, None] * v[None, :]).to(dtype=target_dtype)
     return out
 
 def generate_ar_calibration(model: nn.Module, device: torch.device, vocab_size: int = 1024,
@@ -599,13 +689,117 @@ def gptq_quantize_weight(weight: Tensor, hessian: Tensor, clip_range: int = 31,
     return (Q * sf[:, None]).to(dtype=weight.dtype)
 GPTQ_SD_K = float(os.environ.get("GPTQ_SD_K", "15.0"))
 GPTQ_CR = int(os.environ.get("GPTQ_CR", "31"))
+def _is_recurrence_layer(name: str) -> bool:
+    if not name.startswith("blocks."):
+        return False
+    try:
+        idx = int(name.split(".", 2)[1])
+    except (ValueError, IndexError):
+        return False
+    lo = int(os.environ.get("LOOP_START", "4"))
+    hi = int(os.environ.get("LOOP_END", "5"))
+    return lo <= idx <= hi
+
 def _get_quant_config(name):
+    cr = 63 if (_RECUR_INT7 and _is_recurrence_layer(name)) else GPTQ_CR
     if "attn.c_k.weight" in name or ".mlp.proj.weight" in name or name.endswith("blocks.0.mlp.fc.weight"):
-        return GPTQ_CR, float(os.environ.get("OUTLIER_K", "18.0"))
-    return GPTQ_CR, GPTQ_SD_K
+        return cr, float(os.environ.get("OUTLIER_K", "18.0"))
+    return cr, GPTQ_SD_K
+def _int_entropy_bits(Wq: Tensor, sf: Tensor, cr: int) -> float:
+    """Shannon entropy (bits/element) of the quantized int values. Proxy for brotli
+    compressibility: lower entropy → smaller artifact."""
+    sfb = sf.view(-1, 1).clamp_min(1e-12)
+    Wq_int = (Wq.float() / sfb).round().clamp(-cr, cr).to(torch.int64)
+    flat = (Wq_int + cr).flatten()
+    counts = torch.bincount(flat, minlength=2 * cr + 1).float()
+    probs = counts / counts.sum().clamp_min(1)
+    probs = probs[probs > 0]
+    return float(-(probs * probs.log2()).sum().item())
+
+def _adaptive_k_sweep(weight: Tensor, H: Tensor, cr: int) -> tuple[Tensor, Tensor, float, float]:
+    """Sweep k ∈ _ADAPTIVE_K_CANDIDATES; pick MSE-best k whose int-value entropy is
+    ≤ _ADAPTIVE_K_ENTROPY_CAP (keeps artifact within budget). If no candidate satisfies
+    the cap, fall back to the lowest-entropy one.
+
+    Returns (best_sf, best_Wq, best_k, best_mse). H-weighted MSE is ((dW @ H) * dW).sum().
+    """
+    orig_W = weight.data.float()
+    dev = weight.device
+    row_std = orig_W.std(dim=1).clamp_min(1e-12)
+    best_k = None; best_mse = float("inf"); best_sf = None; best_Wq = None
+    fallback_ent = float("inf"); fallback_k = None; fallback_sf = None; fallback_Wq = None; fallback_mse = float("inf")
+    for k in _ADAPTIVE_K_CANDIDATES:
+        sf = (k * row_std / cr).to(device=dev)
+        Wq = gptq_quantize_weight(weight.data, H, clip_range=cr, scale_override=sf)
+        ent = _int_entropy_bits(Wq, sf, cr)
+        dW = orig_W - Wq.float()
+        mse = float((dW @ H * dW).sum().item())
+        if ent <= _ADAPTIVE_K_ENTROPY_CAP and mse < best_mse:
+            best_mse = mse; best_k = float(k); best_sf = sf; best_Wq = Wq
+        if ent < fallback_ent:
+            fallback_ent = ent; fallback_k = float(k); fallback_sf = sf; fallback_Wq = Wq; fallback_mse = mse
+    if best_k is None:
+        return fallback_sf, fallback_Wq, fallback_k, fallback_mse
+    return best_sf, best_Wq, best_k, best_mse
+
+def _walsh_hadamard(n: int, device=None, dtype=torch.float32) -> Tensor:
+    assert n > 0 and (n & (n - 1)) == 0, f"n={n} must be power of 2"
+    H = torch.ones((1, 1), device=device, dtype=dtype)
+    while H.shape[0] < n:
+        H = torch.cat([torch.cat([H,  H], dim=1),
+                       torch.cat([H, -H], dim=1)], dim=0)
+    return H / math.sqrt(n)
+
+def _rht_matrix(n: int, seed: int, device=None, dtype=torch.float32) -> Tensor:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed))
+    signs = (torch.randint(0, 2, (n,), generator=g) * 2 - 1).to(device=device, dtype=dtype)
+    H = _walsh_hadamard(n, device=device, dtype=dtype)
+    return H * signs[None, :]
+
+def _apply_rht_v_inplace(model: nn.Module, seed: int, log_fn=print) -> int:
+    """Randomized Hadamard on V head_dim. For each block rotate c_v output
+    head_dim (per KV head) by R_b and un-rotate attn.proj input head_dim (per
+    query head). Math-identity (xsa stays equivariant: <y,vn> dot-product is
+    rotation-invariant). Goal: incoherent c_v / proj weights → lower int6 gap."""
+    rotated_layers = 0
+    head_dim = None
+    for bi, block in enumerate(model.blocks):
+        attn = block.attn
+        c_v = getattr(attn, "c_v", None)
+        proj = getattr(attn, "proj", None)
+        if c_v is None or proj is None:
+            log_fn("rht_v: block.attn has no c_v/proj (qkv_fused?); skipping")
+            return 0
+        head_dim = attn.head_dim
+        num_kv_heads = attn.num_kv_heads
+        num_heads = attn.num_heads
+        if (head_dim & (head_dim - 1)) != 0:
+            log_fn(f"rht_v: head_dim={head_dim} not power-of-2; skipping")
+            return 0
+        device = c_v.weight.device
+        R = _rht_matrix(head_dim, seed + bi, device=device, dtype=torch.float32)
+        with torch.no_grad():
+            wv = c_v.weight.data.float().view(num_kv_heads, head_dim, -1)
+            wv_r = torch.einsum("ij,hjd->hid", R, wv)
+            c_v.weight.data.copy_(
+                wv_r.reshape(num_kv_heads * head_dim, -1).to(dtype=c_v.weight.dtype)
+            )
+            wp = proj.weight.data.float().view(-1, num_heads, head_dim)
+            wp_r = torch.einsum("dhi,ji->dhj", wp, R)
+            proj.weight.data.copy_(
+                wp_r.reshape(-1, num_heads * head_dim).to(dtype=proj.weight.dtype)
+            )
+            rotated_layers += 2
+    log_fn(f"rht_v: rotated {rotated_layers} matrices across {len(model.blocks)} blocks "
+           f"(head_dim={head_dim}, seed_base={seed})")
+    return rotated_layers
+
 def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_fn=print, calib_override=None) -> dict[str, Tensor]:
     """GPTQ with SD-Clip scale: sf = k * std(row) / cr. Returns (scales, crs)."""
     t0 = time.perf_counter()
+    if _RHT_V:
+        _apply_rht_v_inplace(model, _RHT_SEED, log_fn=log_fn)
     if calib_override is not None:
         calib = calib_override
         log_fn(f"gptq: using provided calibration ({len(calib)} seqs)")
@@ -623,6 +817,7 @@ def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_
     count = 0
     gptq_scales: dict[str, Tensor] = {}
     gptq_crs: dict[str, int] = {}
+    adaptive_log: list[tuple[str, float, float]] = []
     for name, module in model.named_modules():
         if isinstance(module, CastedLinear) and module.weight.ndim == 2:
             pname = name + ".weight"
@@ -631,13 +826,19 @@ def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_
                 continue
             cr, k = _get_quant_config(pname)
             with torch.no_grad():
-                if bool(int(os.environ.get("ABSMAX_SCALE", "0"))):
-                    sf = (module.weight.data.float().abs().amax(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                absmax = bool(int(os.environ.get("ABSMAX_SCALE", "0")))
+                if _ADAPTIVE_K and not absmax:
+                    sf, Wq, chosen_k, chosen_mse = _adaptive_k_sweep(module.weight.data, H, cr)
+                    adaptive_log.append((pname, chosen_k, chosen_mse))
                 else:
-                    sf = (k * module.weight.data.float().std(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                    if absmax:
+                        sf = (module.weight.data.float().abs().amax(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                    else:
+                        sf = (k * module.weight.data.float().std(dim=1).clamp_min(1e-12) / cr).to(device=module.weight.device)
+                    Wq = gptq_quantize_weight(module.weight.data, H, clip_range=cr, scale_override=sf)
                 gptq_scales[pname] = sf.cpu()
                 gptq_crs[pname] = cr
-                module.weight.data.copy_(gptq_quantize_weight(module.weight.data, H, clip_range=cr, scale_override=sf))
+                module.weight.data.copy_(Wq)
             count += 1
     if "tok_emb.weight" in hessians and hasattr(model, "tok_emb"):
         emb_bits = int(os.environ.get("EMB_BITS", "8"))
@@ -646,14 +847,33 @@ def apply_gptq_sdclip_inplace(model: nn.Module, device: torch.device, args, log_
         H_emb = hessians["tok_emb.weight"]
         with torch.no_grad():
             w = model.tok_emb.weight.data
-            if bool(int(os.environ.get("ABSMAX_SCALE", "0"))):
-                sf_emb = (w.float().abs().amax(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
+            orig_w = w.clone().float() if _WTE_RANK1 else None
+            absmax = bool(int(os.environ.get("ABSMAX_SCALE", "0")))
+            if _ADAPTIVE_K and not absmax:
+                sf_emb, Wq_emb, chosen_k, chosen_mse = _adaptive_k_sweep(w, H_emb, emb_cr)
+                adaptive_log.append(("tok_emb.weight", chosen_k, chosen_mse))
             else:
-                sf_emb = (emb_k * w.float().std(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
+                if absmax:
+                    sf_emb = (w.float().abs().amax(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
+                else:
+                    sf_emb = (emb_k * w.float().std(dim=1).clamp_min(1e-12) / emb_cr).to(device=w.device)
+                Wq_emb = gptq_quantize_weight(w, H_emb, clip_range=emb_cr, scale_override=sf_emb)
             gptq_scales["tok_emb.weight"] = sf_emb.cpu()
             gptq_crs["tok_emb.weight"] = emb_cr
-            model.tok_emb.weight.data.copy_(gptq_quantize_weight(w, H_emb, clip_range=emb_cr, scale_override=sf_emb))
+            model.tok_emb.weight.data.copy_(Wq_emb)
+            if _WTE_RANK1 and orig_w is not None:
+                residual = orig_w - Wq_emb.float()
+                U, S, Vh = torch.linalg.svd(residual, full_matrices=False)
+                u = (U[:, 0] * S[0]).contiguous().detach()
+                v = Vh[0, :].contiguous().detach()
+                model._wte_rank1 = {"u": u, "v": v}
+                log_fn(f"wte_rank1: svd residual ||res||_F={residual.norm().item():.4f}  ||rank1||_F={(S[0].item()):.4f}  energy_ratio={(S[0].item() / residual.norm().item()):.4f}")
         count += 1
+    if _ADAPTIVE_K and adaptive_log:
+        from collections import Counter
+        k_hist = Counter(round(rec[1], 2) for rec in adaptive_log)
+        total_mse = sum(rec[2] for rec in adaptive_log)
+        log_fn(f"gptq: adaptive_k chose {dict(k_hist)} across {len(adaptive_log)} layers; sum_h_weighted_mse={total_mse:.3f}")
     log_fn(f"gptq: pass1 quantized {count} layers in {time.perf_counter() - t2:.1f}s, total {time.perf_counter() - t0:.1f}s")
     if bool(int(os.environ.get("TWO_PASS_GPTQ", "0"))):
         log_fn("gptq: pass2 — re-collecting Hessians from quantized model...")
@@ -748,8 +968,44 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
+        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
+        if _NEWTON_MUON:
+            self.register_buffer("_nm_gram", torch.eye(in_features, dtype=torch.float32), persistent=False)
+
     def forward(self, x: Tensor) -> Tensor:
+        if _NEWTON_MUON and self.training:
+            x_flat = x.detach().reshape(-1, x.shape[-1]).float()
+            if x_flat.shape[0] > _NEWTON_MUON_SAMPLE:
+                x_flat = x_flat[:_NEWTON_MUON_SAMPLE]
+            gram = (x_flat.T @ x_flat) / x_flat.shape[0]
+            self._nm_gram.mul_(_NEWTON_MUON_EMA).add_(gram, alpha=1.0 - _NEWTON_MUON_EMA)
         return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
+
+def _refresh_newton_muon_preconditioners(model: nn.Module) -> None:
+    if not _NEWTON_MUON:
+        return
+    refresh_eps_rel = float(os.environ.get("NEWTON_MUON_EPS", "0.01"))
+    with torch.no_grad():
+        ok = 0
+        skipped = 0
+        for m in model.modules():
+            if isinstance(m, CastedLinear) and hasattr(m, "_nm_gram"):
+                gram = m._nm_gram.detach().float()
+                diag = gram.diag()
+                diag_scale = diag.mean().clamp_min(1e-6)
+                eps_val = max(refresh_eps_rel * diag_scale.item(), 1e-4)
+                reg = gram + eps_val * torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
+                try:
+                    L = torch.linalg.cholesky(reg)
+                    inv = torch.cholesky_inverse(L)
+                    norm = inv.diag().mean().clamp_min(1e-8)
+                    _newton_muon_inv[id(m.weight)] = inv / norm
+                    ok += 1
+                except torch._C._LinAlgError:
+                    skipped += 1
+        if skipped:
+            print(f"newton_muon: refresh ok={ok} skipped={skipped} (singular grams)", flush=True)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
@@ -799,9 +1055,13 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.kv_dim = kv_dim
+        if _QKV_FUSED:
+            self.c_qkv = CastedLinear(dim, dim + 2 * kv_dim, bias=False)
+        else:
+            self.c_q = CastedLinear(dim, dim, bias=False)
+            self.c_k = CastedLinear(dim, kv_dim, bias=False)
+            self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -809,9 +1069,16 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        if _QKV_FUSED:
+            qkv = self.c_qkv(x)
+            q_flat, k_flat, v_flat = qkv.split([dim, self.kv_dim, self.kv_dim], dim=-1)
+            q = q_flat.reshape(bsz, seqlen, self.num_heads, self.head_dim)
+            k = k_flat.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            v = v_flat.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        else:
+            q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+            k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         q = apply_rotary_emb(q, cos, sin)
@@ -871,6 +1138,22 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        if _RESID_FUSE:
+            rm = self.resid_mix.to(dtype=x.dtype)
+            x = rm[0] * x + rm[1] * x0
+            pre = self._ln_pre_scale
+            post = self._ln_post_scale
+            atn = self.attn_scale.to(dtype=x.dtype)
+            mlp = self.mlp_scale.to(dtype=x.dtype)
+            if self.parallel_residual:
+                attn_out, v = self.attn(pre * self.attn_norm(x), cos, sin, v0)
+                mlp_out = self.mlp(pre * self.mlp_norm(x))
+                x = x + post * atn * attn_out + post * mlp * mlp_out
+            else:
+                attn_out, v = self.attn(pre * self.attn_norm(x), cos, sin, v0)
+                x = x + post * atn * attn_out
+                x = x + post * mlp * self.mlp(pre * self.mlp_norm(x))
+            return x, v
         mix_a, mix_b = self.resid_mix.to(dtype=x.dtype).unbind(0)
         x = mix_a * x + mix_b * x0
         pre = self._ln_pre_scale
@@ -952,10 +1235,20 @@ class GPT(nn.Module):
             if v0 is None:
                 v0 = v
             skips.append(x)
+        if _HOIST_SKIP_GATE and self.num_skip_weights > 0:
+            skip_w_cast = self.skip_weights.to(dtype=x.dtype)
+            skip_g_cast = torch.sigmoid(self.skip_gates).to(dtype=x.dtype)
+        else:
+            skip_w_cast = None
+            skip_g_cast = None
         for dec_step, block_idx in enumerate(self.decoder_indices):
             if dec_step < self.num_skip_weights and skips:
-                skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
+                if skip_w_cast is not None:
+                    skip = skip_w_cast[dec_step][None, None, :] * skips.pop()
+                    gate = skip_g_cast[dec_step][None, None, :]
+                else:
+                    skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
                 x = x + gate * skip
             x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
         return x
@@ -1280,6 +1573,8 @@ def main() -> None:
                 group["lr"] = group["base_lr"] * scale
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        if _NEWTON_MUON and step >= _NEWTON_MUON_WARMUP and step % _NEWTON_MUON_REFRESH == 0:
+            _refresh_newton_muon_preconditioners(base_model)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1339,12 +1634,23 @@ def main() -> None:
         torch.cuda.synchronize()
         log0(f"pre-quantization post-ema val_loss:{_pq_loss:.6f} val_bpb:{_pq_bpb:.6f} eval_time:{1000.0 * (time.perf_counter() - _t_pre):.0f}ms")
     _val_calib = None
-    if bool(int(os.environ.get("VAL_CALIB", "1"))) or bool(int(os.environ.get("REAL_DATA_CALIB", "0"))):
+    _train_calib_enabled = bool(int(os.environ.get("TRAIN_CALIB", "1")))
+    _val_calib_enabled = bool(int(os.environ.get("VAL_CALIB", "1"))) or bool(int(os.environ.get("REAL_DATA_CALIB", "0")))
+    if _train_calib_enabled or _val_calib_enabled:
         rng = torch.Generator(); rng.manual_seed(args.seed)
         _n_calib = int(os.environ.get("CALIB_BATCHES", "64"))
-        _vc = [val_tokens[i:i+args.train_seq_len+1].to(torch.int64).unsqueeze(0) for i in (torch.randint(0, val_tokens.numel()-args.train_seq_len-1, (_n_calib,), generator=rng)).tolist()]
-        _val_calib = _vc
-        log0(f"val_calib: using {len(_val_calib)} validation windows (seq_len={args.train_seq_len})")
+        if _train_calib_enabled:
+            _shard_files = sorted(glob.glob(args.train_files))
+            if not _shard_files:
+                raise ValueError(f"TRAIN_CALIB=1 but no shards at {args.train_files}")
+            _calib_src_toks = load_data_shard(Path(_shard_files[0]))
+            _calib_src_label = f"train shard {Path(_shard_files[0]).name}"
+        else:
+            _calib_src_toks = val_tokens
+            _calib_src_label = "validation"
+        _idx_hi = _calib_src_toks.numel() - args.train_seq_len - 1
+        _val_calib = [_calib_src_toks[i:i+args.train_seq_len+1].to(torch.int64).unsqueeze(0) for i in torch.randint(0, _idx_hi, (_n_calib,), generator=rng).tolist()]
+        log0(f"calib: using {len(_val_calib)} windows from {_calib_src_label} (seq_len={args.train_seq_len})")
     gptq_scales, gptq_crs = apply_gptq_sdclip_inplace(base_model, device, args, log_fn=log0, calib_override=_val_calib)
     export_sd = base_model.state_dict()
     if master_process:
@@ -1379,22 +1685,47 @@ def main() -> None:
                 passthrough_t[name] = t
             quant_payload += passthrough_t[name].numel() * passthrough_t[name].element_size()
             continue
+        layer_cr = GPTQ_CR
         if name in gptq_scales:
             sf = gptq_scales[name].float()
             t32 = t.float()
             _cr = gptq_crs.get(name, GPTQ_CR)
+            layer_cr = _cr
             q = torch.clamp(torch.round(t32 / sf[:, None]), -_cr, _cr).to(torch.int8).contiguous()
             s = sf.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
         elif "tok_emb.weight" in name:
             q, s = quantize_float_tensor_int6(t, bits=int(os.environ.get("EMB_BITS", "8")), sd_k=float(os.environ.get("EMB_CLIP_K", "12.85")))
+            layer_cr = (2 ** (int(os.environ.get("EMB_BITS", "8")) - 1)) - 1
         else:
             q, s = quantize_float_tensor_int6(t, bits=6)
+            layer_cr = 31
+        meta_entry: dict = {}
+        if s.ndim > 0:
+            meta_entry["scheme"] = "per_row"; meta_entry["axis"] = 0
+        if _BITPACK and layer_cr in (31, 63):
+            q_packed, n_orig, orig_shape = _bitpack_int(q, layer_cr)
+            meta_entry["bitpacked"] = True
+            meta_entry["cr"] = layer_cr
+            meta_entry["n_original"] = n_orig
+            meta_entry["orig_shape"] = list(orig_shape)
+            q = q_packed
         quantized_t[name] = q
         scales_t[name] = s
         dtypes_t[name] = str(t.dtype).removeprefix("torch.")
-        if s.ndim > 0:
-            qmeta_t[name] = {"scheme": "per_row", "axis": 0}
+        if meta_entry:
+            qmeta_t[name] = meta_entry
         quant_payload += q.numel() * q.element_size() + s.numel() * s.element_size()
+    if hasattr(base_model, "_wte_rank1"):
+        u_cpu = base_model._wte_rank1["u"].detach().to("cpu")
+        v_cpu = base_model._wte_rank1["v"].detach().to("cpu")
+        u_store = u_cpu.to(INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+        v_store = v_cpu.to(INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+        passthrough_t["tok_emb_rank1_u"] = u_store
+        passthrough_t["tok_emb_rank1_v"] = v_store
+        passthrough_orig_dtypes_t["tok_emb_rank1_u"] = "float32"
+        passthrough_orig_dtypes_t["tok_emb_rank1_v"] = "float32"
+        quant_payload += u_store.numel() * u_store.element_size() + v_store.numel() * v_store.element_size()
+        log0(f"wte_rank1: stored u {tuple(u_store.shape)} + v {tuple(v_store.shape)} ({(u_store.numel() + v_store.numel()) * u_store.element_size()} bytes fp16)")
     quant_obj = {"__quant_format__": f"gptq_sdclip_cr{cr}_per_row_v1", "quantized": quantized_t, "scales": scales_t, "dtypes": dtypes_t, "passthrough": passthrough_t}
     if qmeta_t:
         quant_obj["qmeta"] = qmeta_t
