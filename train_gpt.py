@@ -1240,15 +1240,6 @@ class GPT(nn.Module):
         noloop = list(range(num_layers))
         self._noloop_enc = noloop[: len(noloop) // 2]
         self._noloop_dec = noloop[len(noloop) // 2 :]
-        self._phase_indices: dict[int, tuple[list[int], list[int]]] = {0: (self._noloop_enc, self._noloop_dec)}
-        for _nl in range(1, num_loops + 1):
-            _seg = list(range(loop_start, loop_end + 1))
-            _idx = list(range(loop_start))
-            for _ in range(_nl + 1):
-                _idx.extend(_seg)
-            _idx.extend(range(loop_end + 1, num_layers))
-            _half = len(_idx) // 2
-            self._phase_indices[_nl] = (_idx[:_half], _idx[_half:])
         self.encoder_indices = self._looped_enc
         self.decoder_indices = self._looped_dec
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
@@ -1293,7 +1284,6 @@ class GPT(nn.Module):
         else:
             skip_w_cast = None
             skip_g_cast = None
-        _skip_lerp = bool(int(os.environ.get("SKIP_LERP", "0")))
         for dec_step, block_idx in enumerate(self.decoder_indices):
             if dec_step < self.num_skip_weights and skips:
                 if skip_w_cast is not None:
@@ -1302,10 +1292,7 @@ class GPT(nn.Module):
                 else:
                     skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
                     gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
-                if _skip_lerp:
-                    x = torch.lerp(skip, x, gate)
-                else:
-                    x = x + gate * skip
+                x = x + gate * skip
             x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
         return x
 
@@ -1506,53 +1493,34 @@ def main() -> None:
             if isinstance(module, CastedLinear): module.float()
         restore_low_dim_params_to_fp32(base_model)
     _prewarm_enabled = bool(int(os.environ.get("PREWARM", "1")))
-    _curriculum_str = os.environ.get("CURRICULUM_PHASES", "").strip()
-    _curriculum_phases: list[tuple[float, int]] = []
-    if _curriculum_str:
-        for _part in _curriculum_str.split(","):
-            _f, _n = _part.strip().split(":")
-            _curriculum_phases.append((float(_f), int(_n)))
-        _curriculum_phases.sort()
-        log0(f"curriculum: phases={_curriculum_phases} (num_loops=0 before first phase)")
-    _current_phase_nl = 0
-    if not _skip_train and _curriculum_phases:
-        base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[0]
-    elif not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0:
+    if not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0:
         base_model.encoder_indices = base_model._noloop_enc
         base_model.decoder_indices = base_model._noloop_dec
-    if not _skip_train and _prewarm_enabled and args.num_loops > 0 and (_curriculum_phases or args.enable_looping_at > 0):
-        if _curriculum_phases:
-            _phase_nls_to_warm = sorted(set([0] + [_nl for _, _nl in _curriculum_phases]))
-        else:
-            _phase_nls_to_warm = [args.num_loops]
-        log0(f"pre-warming compile graphs for num_loops={_phase_nls_to_warm} (2 iters each)...")
+    if not _skip_train and args.enable_looping_at > 0 and args.num_loops > 0 and _prewarm_enabled:
+        log0("pre-warming looped compile graph (forward+backward+opt.step, 2 iters)...")
         _t_warm = time.perf_counter()
         _pw_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         _pw_opt_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        for _phase_nl in _phase_nls_to_warm:
-            base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[_phase_nl]
-            log0(f"  prewarm num_loops={_phase_nl} encoder_len={len(base_model.encoder_indices)} decoder_len={len(base_model.decoder_indices)}")
-            model.train()
-            for _pw_iter in range(2):
-                zero_grad_all()
-                for micro_step in range(grad_accum_steps):
-                    if distributed:
-                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                    _pw_x, _pw_y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        _pw_loss = model(_pw_x, _pw_y)
-                    (_pw_loss * grad_scale).backward()
-                for opt in optimizers: opt.step()
-                zero_grad_all()
+        base_model.encoder_indices = base_model._looped_enc
+        base_model.decoder_indices = base_model._looped_dec
+        model.train()
+        for _pw_iter in range(2):
+            zero_grad_all()
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                _pw_x, _pw_y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    _pw_loss = model(_pw_x, _pw_y)
+                (_pw_loss * grad_scale).backward()
+            for opt in optimizers: opt.step()
+            zero_grad_all()
         base_model.load_state_dict(_pw_model_state, strict=True)
         for opt, state in zip(optimizers, _pw_opt_states, strict=True): opt.load_state_dict(state)
         zero_grad_all()
-        if _curriculum_phases:
-            base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[0]
-        else:
-            base_model.encoder_indices = base_model._noloop_enc
-            base_model.decoder_indices = base_model._noloop_dec
-        log0(f"prewarm done in {time.perf_counter()-_t_warm:.1f}s")
+        base_model.encoder_indices = base_model._noloop_enc
+        base_model.decoder_indices = base_model._noloop_dec
+        log0(f"looped pre-warm done in {time.perf_counter()-_t_warm:.1f}s")
     if not _skip_train and args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1625,17 +1593,8 @@ def main() -> None:
                 log0(f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms step:{step}/{args.iterations}")
             break
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        frac_done = elapsed_ms / max(max_wallclock_ms, 1.0) if max_wallclock_ms else step / args.iterations
-        if _curriculum_phases:
-            target_nl = 0
-            for (_f_th, _nl) in _curriculum_phases:
-                if frac_done >= _f_th:
-                    target_nl = _nl
-            if target_nl != _current_phase_nl:
-                base_model.encoder_indices, base_model.decoder_indices = base_model._phase_indices[target_nl]
-                log0(f"curriculum step:{step} frac:{frac_done:.3f} num_loops {_current_phase_nl}->{target_nl}")
-                _current_phase_nl = target_nl
-        elif args.enable_looping_at > 0 and base_model.encoder_indices is base_model._noloop_enc:
+        if args.enable_looping_at > 0 and base_model.encoder_indices is base_model._noloop_enc:
+            frac_done = elapsed_ms / max(max_wallclock_ms, 1.0) if max_wallclock_ms else step / args.iterations
             if frac_done >= args.enable_looping_at:
                 base_model.encoder_indices = base_model._looped_enc
                 base_model.decoder_indices = base_model._looped_dec
