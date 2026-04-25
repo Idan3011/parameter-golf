@@ -1293,7 +1293,7 @@ class GPT(nn.Module):
         else:
             skip_w_cast = None
             skip_g_cast = None
-        _skip_lerp = bool(int(os.environ.get("SKIP_LERP", "1")))
+        _skip_lerp = bool(int(os.environ.get("SKIP_LERP", "0")))
         for dec_step, block_idx in enumerate(self.decoder_indices):
             if dec_step < self.num_skip_weights and skips:
                 if skip_w_cast is not None:
@@ -1576,12 +1576,21 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    ema_state = {k: v.detach().float().clone() for k, v in base_model.state_dict().items()}
-    _ema_keys = list(ema_state.keys())
-    _ema_orig_dtypes = {k: v.dtype for k, v in base_model.state_dict().items()}
-    _ema_param_map = dict(base_model.named_parameters())
-    _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
-    _ema_state_refs = [ema_state[k] for k in _ema_keys]
+    _skip_ema_accum = bool(int(os.environ.get("SKIP_EMA", "0")))
+    _skip_swa = bool(int(os.environ.get("SKIP_SWA", "0")))
+    if _skip_ema_accum:
+        ema_state = {}
+        _ema_keys = []
+        _ema_orig_dtypes = {}
+        _ema_model_refs = []
+        _ema_state_refs = []
+    else:
+        ema_state = {k: v.detach().float().clone() for k, v in base_model.state_dict().items()}
+        _ema_keys = list(ema_state.keys())
+        _ema_orig_dtypes = {k: v.dtype for k, v in base_model.state_dict().items()}
+        _ema_param_map = dict(base_model.named_parameters())
+        _ema_model_refs = [_ema_param_map[k] for k in _ema_keys]
+        _ema_state_refs = [ema_state[k] for k in _ema_keys]
     _swa_gpu: list[Tensor] | None = None
     swa_count = 0
     _reached_cap_t = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1665,10 +1674,11 @@ def main() -> None:
         step += 1
         _ema_d = min(args.ema_decay, step / (step + 10)) if bool(int(os.environ.get("DYNAMIC_EMA", "0"))) else args.ema_decay
         with torch.no_grad():
-            torch._foreach_mul_(_ema_state_refs, _ema_d)
-            _ema_model_fp32 = [p.float() if p.dtype != torch.float32 else p for p in _ema_model_refs]
-            torch._foreach_add_(_ema_state_refs, _ema_model_fp32, alpha=1.0 - _ema_d)
-            if scale < 0.5 and step % 5 == 0:
+            if not _skip_ema_accum:
+                torch._foreach_mul_(_ema_state_refs, _ema_d)
+                _ema_model_fp32 = [p.float() if p.dtype != torch.float32 else p for p in _ema_model_refs]
+                torch._foreach_add_(_ema_state_refs, _ema_model_fp32, alpha=1.0 - _ema_d)
+            if not _skip_swa and scale < 0.5 and step % 5 == 0:
                 refs_fp32 = [p.float() if p.dtype != torch.float32 else p for p in _ema_model_refs]
                 if _swa_gpu is None:
                     _swa_gpu = [t.detach().clone() for t in refs_fp32]
@@ -1691,23 +1701,23 @@ def main() -> None:
             stop_after_step = step
     if not _skip_train:
         log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
-        ema_state = {k: v.cpu() for k, v in ema_state.items()}
-        if _swa_gpu is not None and swa_count > 0:
-            log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
-            torch._foreach_div_(_swa_gpu, float(swa_count))
-            for i, k in enumerate(_ema_keys):
-                ema_state[k] = 0.5 * ema_state[k] + 0.5 * _swa_gpu[i].cpu()
-            del _swa_gpu
-        if bool(int(os.environ.get("SKIP_EMA", "0"))):
+        if _skip_ema_accum:
             log0("ema: SKIPPED (SKIP_EMA=1) — using training-time weights")
         else:
+            ema_state = {k: v.cpu() for k, v in ema_state.items()}
+            if _swa_gpu is not None and swa_count > 0:
+                log0(f"swa: averaging {swa_count} checkpoints on top of EMA")
+                torch._foreach_div_(_swa_gpu, float(swa_count))
+                for i, k in enumerate(_ema_keys):
+                    ema_state[k] = 0.5 * ema_state[k] + 0.5 * _swa_gpu[i].cpu()
+                del _swa_gpu
             log0("ema: loading weights")
             ema_state = {k: v.to(dtype=_ema_orig_dtypes[k]) for k, v in ema_state.items()}
             base_model.load_state_dict(ema_state, strict=True)
+            del ema_state
         for module in base_model.modules():
             if isinstance(module, CastedLinear): module.float()
         restore_low_dim_params_to_fp32(base_model)
-        del ema_state
         if master_process:
             torch.save(base_model.state_dict(), "final_model.float.pt")
             log0(f"saved pre-GPTQ float checkpoint: {os.path.getsize('final_model.float.pt')} bytes")
