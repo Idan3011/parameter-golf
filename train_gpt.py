@@ -51,6 +51,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 _YOU_NS = [(4.0848, -6.8946, 2.9270), (3.9505, -6.3029, 2.6377), (3.7418, -5.5913, 2.3037), (2.8769, -3.1427, 1.2046), (2.8366, -3.0525, 1.2012)]
 _USE_YOU = bool(int(os.environ.get("USE_YOU_COEFFS", "0")))
 _HOIST_SKIP_GATE = bool(int(os.environ.get("HOIST_SKIP_GATE", "0")))
+_SKIP_LERP = bool(int(os.environ.get("SKIP_LERP", "0")))
+_SHD_DIM = int(os.environ.get("SHD_DIM", "0"))
 _ADAPTIVE_K = bool(int(os.environ.get("ADAPTIVE_K", "0")))
 _ADAPTIVE_K_CANDIDATES = (10.0, 12.85, 15.0, 18.0, 22.0)
 _ADAPTIVE_K_ENTROPY_CAP = float(os.environ.get("ADAPTIVE_K_ENTROPY_CAP", "4.0"))
@@ -117,7 +119,7 @@ class Hyperparameters:
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0.25"))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", "32768"))
-    ttt_lr = float(os.environ.get("TTT_LR", "0.001"))
+    ttt_lr = float(os.environ.get("TTT_LR", "0.01"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", "0"))
     ttt_score_batch = int(os.environ.get("TTT_SCORE_BATCH", "64"))
@@ -125,7 +127,7 @@ class Hyperparameters:
     ttt_grad_clip = 1.0
     eval_hash_buckets = int(os.environ.get("EVAL_HASH_BUCKETS", "16384"))
     eval_hash_lr_mult = float(os.environ.get("EVAL_HASH_LR_MULT", "10.0"))
-    lora_ttt = bool(int(os.environ.get("LORA_TTT", "1")))
+    lora_ttt = bool(int(os.environ.get("LORA_TTT", "0")))
     lora_rank = int(os.environ.get("LORA_RANK", "32"))
     lora_alpha = float(os.environ.get("LORA_ALPHA", "64.0"))
     lora_wd = float(os.environ.get("LORA_WD", "0.01"))
@@ -324,17 +326,16 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         lora_params = [p for n, p in base_model.named_parameters() if "lora_" in n and not _fr(n) and p.requires_grad]
         param_groups = [{"params": lora_params, "lr": ttt_lr}]
         if hash_params:
-            param_groups.append({"params": hash_params, "lr": ttt_lr * args.eval_hash_lr_mult})
+            param_groups.append({"params": hash_params, "lr": ttt_lr})
         ttt_params = lora_params + hash_params
         opt = torch.optim.SGD(param_groups, momentum=0.9)
     else:
         base_params = [p for n, p in base_model.named_parameters() if not _fr(n) and "eval_hash_emb" not in n and "lora_" not in n]
         param_groups = [{"params": base_params, "lr": ttt_lr}]
         if hash_params:
-            param_groups.append({"params": hash_params, "lr": ttt_lr * args.eval_hash_lr_mult})
+            param_groups.append({"params": hash_params, "lr": ttt_lr})
         ttt_params = base_params + hash_params
         opt = torch.optim.SGD(param_groups, momentum=0.9)
-    for pg in opt.param_groups: pg['_base_lr'] = pg['lr']
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
@@ -358,8 +359,8 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
             chunk_end = min((ci + 1) * chunk_tok, total_tokens)
             chunk_seqs = (chunk_end - chunk_start) // S
             if chunk_seqs > 0:
-                cos_scale = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in opt.param_groups: pg['lr'] = pg['_base_lr'] * cos_scale
+                cos_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in opt.param_groups: pg['lr'] = cos_lr
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 for _ in range(ttt_epochs):
@@ -1127,6 +1128,11 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        if _SHD_DIM > 0 and _SHD_DIM < self.head_dim:
+            q_shared = q[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).expand(-1, -1, q.size(-2), -1)
+            q = torch.cat([q[..., :-_SHD_DIM], q_shared], dim=-1)
+            k_shared = k[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).expand(-1, -1, k.size(-2), -1)
+            k = torch.cat([k[..., :-_SHD_DIM], k_shared], dim=-1)
         if HAS_FA3:
             y = flash_attn_func(q, k, v, causal=True)
         else:
@@ -1292,7 +1298,10 @@ class GPT(nn.Module):
                 else:
                     skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
                     gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
-                x = x + gate * skip
+                if _SKIP_LERP:
+                    x = torch.lerp(skip, x, gate)
+                else:
+                    x = x + gate * skip
             x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
         return x
 
