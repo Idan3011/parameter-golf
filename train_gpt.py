@@ -98,7 +98,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", "30.0"))
     embed_lr = 0.6
     head_lr = 0.008
-    tied_embed_lr = 0.035
+    tied_embed_lr = 0.03
     tied_embed_init_std = 0.005
     matrix_lr = 0.022
     scalar_lr = float(os.environ.get("SCALAR_LR_VALUE", "0.025"))
@@ -111,13 +111,15 @@ class Hyperparameters:
     adam_eps = 1e-8
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", "0.3"))
     muon_wd = 0.095
+    muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
     adam_wd = float(os.environ.get("ADAM_WD", "0.095"))
+    embed_wd = float(os.environ.get("EMBED_WD", "0.085"))
     ema_decay = float(os.environ.get("EMA_DECAY_VALUE", "0.9965"))
     num_loops = int(os.environ.get("NUM_LOOPS", "2"))
     loop_start = int(os.environ.get("LOOP_START", "4"))
     loop_end = int(os.environ.get("LOOP_END", "5"))
     skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
-    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0.25"))
+    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", "0.37"))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", "32768"))
     ttt_lr = float(os.environ.get("TTT_LR", "0.01"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
@@ -152,8 +154,8 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) ->
 _H5_ASYNC_AR = bool(int(os.environ.get("H5_ASYNC_AR", "1"))) 
 _H5_BUCKET_MB = float(os.environ.get("H5_BUCKET_MB", "10"))
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, wd: float = 0.0):
-        super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, wd=wd))
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, wd: float = 0.0, row_normalize: bool = False):
+        super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, wd=wd, row_normalize=row_normalize))
         self._updates_flat: Tensor | None = None
         self._param_views: list[Tensor] | None = None
         self._lr_scales: list[float] | None = None
@@ -171,6 +173,7 @@ class Muon(torch.optim.Optimizer):
             if not params: continue
             lr, momentum, backend_steps = group["lr"], group["momentum"], group["backend_steps"]
             nesterov, wd = group["nesterov"], group["wd"]
+            row_normalize = group.get("row_normalize", False)
             if self._updates_flat is None:
                 total = sum(int(p.numel()) for p in params)
                 self._updates_flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
@@ -202,6 +205,9 @@ class Muon(torch.optim.Optimizer):
                     buf = state["momentum_buffer"]
                     buf.mul_(momentum).add_(g)
                     if nesterov: g = g.add(buf, alpha=momentum)
+                    if row_normalize:
+                        row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
+                        g = g / row_norms.to(g.dtype)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     if _NEWTON_MUON:
@@ -323,19 +329,11 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     _fr = lambda n: any(f"blocks.{bi}." in n for bi in range(min(freeze_n, len(base_model.blocks))))
     hash_params = list(base_model.eval_hash_emb.parameters()) if base_model.eval_hash_emb is not None else []
     if args.lora_ttt:
-        lora_params = [p for n, p in base_model.named_parameters() if "lora_" in n and not _fr(n) and p.requires_grad]
-        param_groups = [{"params": lora_params, "lr": ttt_lr}]
-        if hash_params:
-            param_groups.append({"params": hash_params, "lr": ttt_lr})
-        ttt_params = lora_params + hash_params
-        opt = torch.optim.SGD(param_groups, momentum=0.9)
+        main_params = [p for n, p in base_model.named_parameters() if "lora_" in n and not _fr(n) and p.requires_grad]
     else:
-        base_params = [p for n, p in base_model.named_parameters() if not _fr(n) and "eval_hash_emb" not in n and "lora_" not in n]
-        param_groups = [{"params": base_params, "lr": ttt_lr}]
-        if hash_params:
-            param_groups.append({"params": hash_params, "lr": ttt_lr})
-        ttt_params = base_params + hash_params
-        opt = torch.optim.SGD(param_groups, momentum=0.9)
+        main_params = [p for n, p in base_model.named_parameters() if not _fr(n) and "eval_hash_emb" not in n and "lora_" not in n]
+    ttt_params = main_params + hash_params
+    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
@@ -1450,10 +1448,10 @@ def main() -> None:
         token_lr = float(_telr)
         log0(f"tied_embed_lr_override: lr={token_lr:.4f} (was {args.tied_embed_lr})")
     optimizer_tok = torch.optim.AdamW([{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.adam_wd, fused=True)
+        betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.embed_wd, fused=True)
     _mlr = float(os.environ.get("MATRIX_LR_VALUE", args.matrix_lr))
     if _mlr != args.matrix_lr: log0(f"matrix_lr_override: lr={_mlr:.4f} (was {args.matrix_lr})")
-    optimizer_muon = Muon(matrix_params, lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd)
+    optimizer_muon = Muon(matrix_params, lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd, row_normalize=args.muon_row_normalize)
     for g in optimizer_muon.param_groups: g["base_lr"] = _mlr
     if _depth_lr:
         _rec_set = set(id(p) for p in _rec_matrix); _dlf = float(os.environ.get("DEPTH_LR_FACTOR", "0.85"))
