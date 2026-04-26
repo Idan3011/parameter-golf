@@ -316,13 +316,20 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         main_params = [p for n, p in base_model.named_parameters() if "eval_hash_emb" not in n and (not frozen_prefixes or not n.startswith(frozen_prefixes))]
         if _freeze_blocks > 0 and log_fn: log_fn(f"ttt: freezing first {_freeze_blocks} blocks ({len(main_params)} params remain)")
     ttt_params = main_params + hash_params
+    _hash_lr = float(os.environ.get("TTT_HASH_LR", "0")) or ttt_lr
+    param_groups = []
+    if main_params:
+        param_groups.append({"params": main_params, "lr": ttt_lr, "_base_lr": ttt_lr})
+    if hash_params:
+        param_groups.append({"params": hash_params, "lr": _hash_lr, "_base_lr": _hash_lr})
+    if log_fn and _hash_lr != ttt_lr: log_fn(f"ttt: split LR — backbone={ttt_lr}, hash={_hash_lr}")
     _ttt_opt = os.environ.get("TTT_OPT", "sgd").lower()
     if _ttt_opt == "adam":
-        opt = torch.optim.Adam(ttt_params, lr=ttt_lr)
+        opt = torch.optim.Adam(param_groups)
     elif _ttt_opt == "adamw":
-        opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
+        opt = torch.optim.AdamW(param_groups, weight_decay=0.0)
     else:
-        opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=float(os.environ.get("TTT_MOMENTUM", "0.9")))
+        opt = torch.optim.SGD(param_groups, momentum=float(os.environ.get("TTT_MOMENTUM", "0.9")))
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
@@ -346,8 +353,8 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
             chunk_end = min((ci + 1) * chunk_tok, total_tokens)
             chunk_seqs = (chunk_end - chunk_start) // S
             if chunk_seqs > 0:
-                cos_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in opt.param_groups: pg['lr'] = cos_lr
+                cos_factor = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in opt.param_groups: pg['lr'] = pg.get('_base_lr', ttt_lr) * cos_factor
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 for _ in range(ttt_epochs):
