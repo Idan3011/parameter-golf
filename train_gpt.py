@@ -766,9 +766,9 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         if _SHD_DIM > 0 and _SHD_DIM < self.head_dim:
-            q_shared = q[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).expand(-1, -1, q.size(-2), -1)
+            q_shared = q[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).detach().expand(-1, -1, q.size(-2), -1)
             q = torch.cat([q[..., :-_SHD_DIM], q_shared], dim=-1)
-            k_shared = k[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).expand(-1, -1, k.size(-2), -1)
+            k_shared = k[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).detach().expand(-1, -1, k.size(-2), -1)
             k = torch.cat([k[..., :-_SHD_DIM], k_shared], dim=-1)
         if HAS_FA3:
             y = flash_attn_func(q, k, v, causal=True)
