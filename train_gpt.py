@@ -311,7 +311,13 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     main_params = [p for n, p in base_model.named_parameters() if "eval_hash_emb" not in n and (not frozen_prefixes or not n.startswith(frozen_prefixes))]
     if _freeze_blocks > 0 and log_fn: log_fn(f"ttt: freezing first {_freeze_blocks} blocks ({len(main_params)} params remain)")
     ttt_params = main_params + hash_params
-    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=float(os.environ.get("TTT_MOMENTUM", "0.9")))
+    _ttt_opt = os.environ.get("TTT_OPT", "sgd").lower()
+    if _ttt_opt == "adam":
+        opt = torch.optim.Adam(ttt_params, lr=ttt_lr)
+    elif _ttt_opt == "adamw":
+        opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
+    else:
+        opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=float(os.environ.get("TTT_MOMENTUM", "0.9")))
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
