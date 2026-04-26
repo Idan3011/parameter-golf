@@ -308,7 +308,7 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     hash_params = list(base_model.eval_hash_emb.parameters()) if base_model.eval_hash_emb is not None else []
     main_params = [p for n, p in base_model.named_parameters() if "eval_hash_emb" not in n]
     ttt_params = main_params + hash_params
-    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
+    opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=float(os.environ.get("TTT_MOMENTUM", "0.9")))
     for ci in range(num_chunks):
         windows = all_windows[ci]
         if not windows: continue
