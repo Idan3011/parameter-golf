@@ -307,9 +307,14 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
     L, T, B = (torch.zeros((), device=device, dtype=torch.float64) for _ in range(3))
     hash_params = list(base_model.eval_hash_emb.parameters()) if base_model.eval_hash_emb is not None else []
     _freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", "0"))
+    _hash_only = bool(int(os.environ.get("TTT_HASH_ONLY", "0")))
     frozen_prefixes = tuple(f"blocks.{i}." for i in range(_freeze_blocks))
-    main_params = [p for n, p in base_model.named_parameters() if "eval_hash_emb" not in n and (not frozen_prefixes or not n.startswith(frozen_prefixes))]
-    if _freeze_blocks > 0 and log_fn: log_fn(f"ttt: freezing first {_freeze_blocks} blocks ({len(main_params)} params remain)")
+    if _hash_only:
+        main_params = []
+        if log_fn: log_fn("ttt: TTT_HASH_ONLY=1 — only eval_hash_emb updates")
+    else:
+        main_params = [p for n, p in base_model.named_parameters() if "eval_hash_emb" not in n and (not frozen_prefixes or not n.startswith(frozen_prefixes))]
+        if _freeze_blocks > 0 and log_fn: log_fn(f"ttt: freezing first {_freeze_blocks} blocks ({len(main_params)} params remain)")
     ttt_params = main_params + hash_params
     _ttt_opt = os.environ.get("TTT_OPT", "sgd").lower()
     if _ttt_opt == "adam":
