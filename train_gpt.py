@@ -306,7 +306,10 @@ def eval_val_ttt(args, base_model, rank, world_size, device, val_tokens,
         ws += stride
     L, T, B = (torch.zeros((), device=device, dtype=torch.float64) for _ in range(3))
     hash_params = list(base_model.eval_hash_emb.parameters()) if base_model.eval_hash_emb is not None else []
-    main_params = [p for n, p in base_model.named_parameters() if "eval_hash_emb" not in n]
+    _freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", "0"))
+    frozen_prefixes = tuple(f"blocks.{i}." for i in range(_freeze_blocks))
+    main_params = [p for n, p in base_model.named_parameters() if "eval_hash_emb" not in n and (not frozen_prefixes or not n.startswith(frozen_prefixes))]
+    if _freeze_blocks > 0 and log_fn: log_fn(f"ttt: freezing first {_freeze_blocks} blocks ({len(main_params)} params remain)")
     ttt_params = main_params + hash_params
     opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=float(os.environ.get("TTT_MOMENTUM", "0.9")))
     for ci in range(num_chunks):
