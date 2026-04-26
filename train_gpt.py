@@ -68,6 +68,7 @@ _newton_muon_inv: dict[int, Tensor] = {}
 _RHT_V = bool(int(os.environ.get("RHT_V", "0")))
 _RHT_SEED = int(os.environ.get("RHT_SEED", "1337"))
 _RESID_FUSE = bool(int(os.environ.get("RESID_FUSE", "0")))
+_IMPROVED_PARRESID = bool(int(os.environ.get("IMPROVED_PARRESID", "0")))
 
 class Hyperparameters:
     _vs = int(os.environ.get("VOCAB_SIZE", "9000"))
@@ -1253,7 +1254,14 @@ class GPT(nn.Module):
         _rope_dims = _rope_dims_env if 0 < _rope_dims_env < _head_dim else None
         self.rotary = Rotary(_head_dim, base=rope_base, rope_dims=_rope_dims)
         parallel_start = 7
+        self.parallel_start = parallel_start
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, num_kv_heads, mlp_mult, qk_gain_init, use_xsa=True, leaky=True, layer_idx=i, parallel_residual=(i >= parallel_start)) for i in range(num_layers)])
+        if _IMPROVED_PARRESID and parallel_start >= 0:
+            self.par_post = nn.Parameter(torch.ones(num_layers, 2, 2, dtype=torch.float32))
+            self.par_resid = nn.Parameter(torch.full((num_layers, 2), 1.1 ** 0.5, dtype=torch.float32))
+        else:
+            self.par_post = None
+            self.par_resid = None
         self.final_norm = RMSNorm()
         self.eval_hash_emb: nn.Embedding | None = None
         self.eval_hash_multiplier = 2039
@@ -1273,34 +1281,91 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _is_parallel(self, i: int) -> bool:
+        return self.par_post is not None and i >= self.parallel_start
+
+    def _par_block(self, i: int, lane0: Tensor, lane1: Tensor, x0: Tensor,
+                   cos: Tensor, sin: Tensor, v0: Tensor | None) -> tuple[Tensor, Tensor, Tensor | None]:
+        block = self.blocks[i]
+        rm = block.resid_mix.to(dtype=lane0.dtype)
+        a_in = rm[0][None, None, :] * lane0 + rm[1][None, None, :] * x0
+        m_in = rm[0][None, None, :] * lane1 + rm[1][None, None, :] * x0
+        pre = block._ln_pre_scale
+        post = block._ln_post_scale
+        attn_out, v = block.attn(pre * block.attn_norm(a_in), cos, sin, v0)
+        mlp_out = block.mlp(pre * block.mlp_norm(m_in))
+        attn_out = post * block.attn_scale.to(dtype=a_in.dtype)[None, None, :] * attn_out
+        mlp_out = post * block.mlp_scale.to(dtype=m_in.dtype)[None, None, :] * mlp_out
+        ar = self.par_resid[i, 0].to(dtype=lane0.dtype)
+        ap = self.par_post[i, 0].to(dtype=lane0.dtype)
+        lane0 = ar * lane0 + ap[0] * attn_out
+        lane1 = ar * lane1 + ap[1] * attn_out
+        mr = self.par_resid[i, 1].to(dtype=lane0.dtype)
+        mp = self.par_post[i, 1].to(dtype=lane0.dtype)
+        lane0 = mr * lane0 + mp[0] * mlp_out
+        lane1 = mr * lane1 + mp[1] * mlp_out
+        return lane0, lane1, v
+
     def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
         cos, sin = self.rotary(x.size(1), x.device, x.dtype)
         v0 = None
-        skips: list[Tensor] = []
+        skips: list = []
+        lane0: Tensor | None = None
+        lane1: Tensor | None = None
         for block_idx in self.encoder_indices:
-            x, v = self.blocks[block_idx](x, x0, cos, sin, v0)
-            if v0 is None:
-                v0 = v
-            skips.append(x)
+            if self._is_parallel(block_idx):
+                if lane0 is None:
+                    lane0 = lane1 = x
+                lane0, lane1, v = self._par_block(block_idx, lane0, lane1, x0, cos, sin, v0)
+                if v0 is None:
+                    v0 = v
+                skips.append((lane0, lane1))
+            else:
+                x, v = self.blocks[block_idx](x, x0, cos, sin, v0)
+                if v0 is None:
+                    v0 = v
+                skips.append(x)
         if _HOIST_SKIP_GATE and self.num_skip_weights > 0:
-            skip_w_cast = self.skip_weights.to(dtype=x.dtype)
-            skip_g_cast = torch.sigmoid(self.skip_gates).to(dtype=x.dtype)
+            skip_w_cast = self.skip_weights.to(dtype=(lane0 if lane0 is not None else x).dtype)
+            skip_g_cast = torch.sigmoid(self.skip_gates).to(dtype=(lane0 if lane0 is not None else x).dtype)
         else:
             skip_w_cast = None
             skip_g_cast = None
         for dec_step, block_idx in enumerate(self.decoder_indices):
             if dec_step < self.num_skip_weights and skips:
+                skip = skips.pop()
+                ref_dtype = (lane0 if lane0 is not None else x).dtype
                 if skip_w_cast is not None:
-                    skip = skip_w_cast[dec_step][None, None, :] * skips.pop()
+                    w = skip_w_cast[dec_step][None, None, :]
                     gate = skip_g_cast[dec_step][None, None, :]
                 else:
-                    skip = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                    gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
-                if _SKIP_LERP:
-                    x = torch.lerp(skip, x, gate)
+                    w = self.skip_weights[dec_step].to(dtype=ref_dtype)[None, None, :]
+                    gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=ref_dtype)[None, None, :]
+                if self._is_parallel(block_idx):
+                    if lane0 is None:
+                        lane0 = lane1 = x
+                    s0, s1 = skip if isinstance(skip, tuple) else (skip, skip)
+                    if _SKIP_LERP:
+                        lane0 = torch.lerp(w * s0, lane0, gate)
+                        lane1 = torch.lerp(w * s1, lane1, gate)
+                    else:
+                        lane0 = lane0 + gate * (w * s0)
+                        lane1 = lane1 + gate * (w * s1)
                 else:
-                    x = x + gate * skip
-            x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
+                    s = skip[1] if isinstance(skip, tuple) else skip
+                    s_w = w * s
+                    if _SKIP_LERP:
+                        x = torch.lerp(s_w, x, gate)
+                    else:
+                        x = x + gate * s_w
+            if self._is_parallel(block_idx):
+                if lane0 is None:
+                    lane0 = lane1 = x
+                lane0, lane1, _ = self._par_block(block_idx, lane0, lane1, x0, cos, sin, v0)
+            else:
+                x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
+        if lane1 is not None:
+            x = lane1
         return x
 
     def _compute_logits(self, x: Tensor) -> Tensor:
@@ -1442,6 +1507,9 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     if base_model.skip_gates.numel() > 0:
         scalar_params.append(base_model.skip_gates)
+    if base_model.par_post is not None:
+        scalar_params.append(base_model.par_post)
+        scalar_params.append(base_model.par_resid)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     _telr = os.environ.get("TIED_EMBED_LR_VALUE", "")
     if _telr:
@@ -1491,11 +1559,15 @@ def main() -> None:
         return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
     _skip_train = bool(int(os.environ.get("SKIP_TRAIN", "0")))
     _load_float_pt = os.environ.get("LOAD_FLOAT_PT", "")
+    _skip_quant_early = bool(int(os.environ.get("SKIP_QUANT", "0")))
     if _skip_train:
-        if not _load_float_pt:
-            raise ValueError("SKIP_TRAIN=1 requires LOAD_FLOAT_PT=<path>")
-        log0(f"SKIP_TRAIN: loading float weights from {_load_float_pt}")
-        base_model.load_state_dict(torch.load(_load_float_pt, map_location=device, weights_only=True), strict=True)
+        if not _load_float_pt and not _skip_quant_early:
+            raise ValueError("SKIP_TRAIN=1 requires LOAD_FLOAT_PT=<path> (or SKIP_QUANT=1 to load weights from existing .ptz)")
+        if _load_float_pt:
+            log0(f"SKIP_TRAIN: loading float weights from {_load_float_pt}")
+            base_model.load_state_dict(torch.load(_load_float_pt, map_location=device, weights_only=True), strict=True)
+        else:
+            log0("SKIP_TRAIN + SKIP_QUANT: weights will be loaded from existing final_model.int6.ptz")
         for module in base_model.modules():
             if isinstance(module, CastedLinear): module.float()
         restore_low_dim_params_to_fp32(base_model)
@@ -1687,133 +1759,137 @@ def main() -> None:
         if master_process:
             torch.save(base_model.state_dict(), "final_model.float.pt")
             log0(f"saved pre-GPTQ float checkpoint: {os.path.getsize('final_model.float.pt')} bytes")
-    if bool(int(os.environ.get("PREQUANT_EVAL", "1"))):
+    _skip_quant = bool(int(os.environ.get("SKIP_QUANT", "0")))
+    if _skip_quant:
+        log0("SKIP_QUANT=1: skipping pre-quant eval + GPTQ; will load existing final_model.int6.ptz")
+    if not _skip_quant and bool(int(os.environ.get("PREQUANT_EVAL", "1"))):
         torch.cuda.synchronize()
         _t_pre = time.perf_counter()
         _pq_loss, _pq_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         torch.cuda.synchronize()
         log0(f"pre-quantization post-ema val_loss:{_pq_loss:.6f} val_bpb:{_pq_bpb:.6f} eval_time:{1000.0 * (time.perf_counter() - _t_pre):.0f}ms")
-    _val_calib = None
-    _train_calib_enabled = bool(int(os.environ.get("TRAIN_CALIB", "1")))
-    _val_calib_enabled = bool(int(os.environ.get("VAL_CALIB", "1"))) or bool(int(os.environ.get("REAL_DATA_CALIB", "0")))
-    if _train_calib_enabled or _val_calib_enabled:
-        rng = torch.Generator(); rng.manual_seed(args.seed)
-        _n_calib = int(os.environ.get("CALIB_BATCHES", "64"))
-        if _train_calib_enabled:
-            _shard_files = sorted(glob.glob(args.train_files))
-            if not _shard_files:
-                raise ValueError(f"TRAIN_CALIB=1 but no shards at {args.train_files}")
-            _calib_src_toks = load_data_shard(Path(_shard_files[0]))
-            _calib_src_label = f"train shard {Path(_shard_files[0]).name}"
-        else:
-            _calib_src_toks = val_tokens
-            _calib_src_label = "validation"
-        _idx_hi = _calib_src_toks.numel() - args.train_seq_len - 1
-        _val_calib = [_calib_src_toks[i:i+args.train_seq_len+1].to(torch.int64).unsqueeze(0) for i in torch.randint(0, _idx_hi, (_n_calib,), generator=rng).tolist()]
-        log0(f"calib: using {len(_val_calib)} windows from {_calib_src_label} (seq_len={args.train_seq_len})")
-    gptq_scales, gptq_crs = apply_gptq_sdclip_inplace(base_model, device, args, log_fn=log0, calib_override=_val_calib)
-    export_sd = base_model.state_dict()
-    if master_process:
-        torch.save(export_sd, "final_model.pt")
-        sz = os.path.getsize("final_model.pt"); csz = len(code.encode("utf-8"))
-        log0(f"Serialized model: {sz} bytes  Code: {csz}  Total: {sz + csz}")
-    cr = GPTQ_CR
-    quantized_t: dict[str, Tensor] = {}
-    scales_t: dict[str, Tensor] = {}
-    dtypes_t: dict[str, str] = {}
-    passthrough_t: dict[str, Tensor] = {}
-    passthrough_orig_dtypes_t: dict[str, str] = {}
-    qmeta_t: dict[str, dict] = {}
-    quant_payload = 0
-    for name, tensor in export_sd.items():
-        t = tensor.detach().to("cpu").contiguous()
-        if not t.is_floating_point():
-            passthrough_t[name] = t
-            quant_payload += t.numel() * t.element_size()
-            continue
-        if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
-            passthrough_t[name] = t.float().contiguous()
-            quant_payload += t.numel() * 4
-            continue
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            if any(p in name for p in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-                passthrough_t[name] = t.float().contiguous()
-            elif t.dtype in {torch.float32, torch.bfloat16}:
-                passthrough_orig_dtypes_t[name] = str(t.dtype).removeprefix("torch.")
-                passthrough_t[name] = t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+    if not _skip_quant:
+        _val_calib = None
+        _train_calib_enabled = bool(int(os.environ.get("TRAIN_CALIB", "1")))
+        _val_calib_enabled = bool(int(os.environ.get("VAL_CALIB", "1"))) or bool(int(os.environ.get("REAL_DATA_CALIB", "0")))
+        if _train_calib_enabled or _val_calib_enabled:
+            rng = torch.Generator(); rng.manual_seed(args.seed)
+            _n_calib = int(os.environ.get("CALIB_BATCHES", "64"))
+            if _train_calib_enabled:
+                _shard_files = sorted(glob.glob(args.train_files))
+                if not _shard_files:
+                    raise ValueError(f"TRAIN_CALIB=1 but no shards at {args.train_files}")
+                _calib_src_toks = load_data_shard(Path(_shard_files[0]))
+                _calib_src_label = f"train shard {Path(_shard_files[0]).name}"
             else:
+                _calib_src_toks = val_tokens
+                _calib_src_label = "validation"
+            _idx_hi = _calib_src_toks.numel() - args.train_seq_len - 1
+            _val_calib = [_calib_src_toks[i:i+args.train_seq_len+1].to(torch.int64).unsqueeze(0) for i in torch.randint(0, _idx_hi, (_n_calib,), generator=rng).tolist()]
+            log0(f"calib: using {len(_val_calib)} windows from {_calib_src_label} (seq_len={args.train_seq_len})")
+        gptq_scales, gptq_crs = apply_gptq_sdclip_inplace(base_model, device, args, log_fn=log0, calib_override=_val_calib)
+        export_sd = base_model.state_dict()
+        if master_process:
+            torch.save(export_sd, "final_model.pt")
+            sz = os.path.getsize("final_model.pt"); csz = len(code.encode("utf-8"))
+            log0(f"Serialized model: {sz} bytes  Code: {csz}  Total: {sz + csz}")
+        cr = GPTQ_CR
+        quantized_t: dict[str, Tensor] = {}
+        scales_t: dict[str, Tensor] = {}
+        dtypes_t: dict[str, str] = {}
+        passthrough_t: dict[str, Tensor] = {}
+        passthrough_orig_dtypes_t: dict[str, str] = {}
+        qmeta_t: dict[str, dict] = {}
+        quant_payload = 0
+        for name, tensor in export_sd.items():
+            t = tensor.detach().to("cpu").contiguous()
+            if not t.is_floating_point():
                 passthrough_t[name] = t
-            quant_payload += passthrough_t[name].numel() * passthrough_t[name].element_size()
-            continue
-        layer_cr = GPTQ_CR
-        if name in gptq_scales:
-            sf = gptq_scales[name].float()
-            t32 = t.float()
-            _cr = gptq_crs.get(name, GPTQ_CR)
-            layer_cr = _cr
-            q = torch.clamp(torch.round(t32 / sf[:, None]), -_cr, _cr).to(torch.int8).contiguous()
-            s = sf.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-        elif "tok_emb.weight" in name:
-            q, s = quantize_float_tensor_int6(t, bits=int(os.environ.get("EMB_BITS", "8")), sd_k=float(os.environ.get("EMB_CLIP_K", "12.85")))
-            layer_cr = (2 ** (int(os.environ.get("EMB_BITS", "8")) - 1)) - 1
-        else:
-            q, s = quantize_float_tensor_int6(t, bits=6)
-            layer_cr = 31
-        meta_entry: dict = {}
-        if s.ndim > 0:
-            meta_entry["scheme"] = "per_row"; meta_entry["axis"] = 0
-        if _BITPACK and layer_cr in (31, 63):
-            q_packed, n_orig, orig_shape = _bitpack_int(q, layer_cr)
-            meta_entry["bitpacked"] = True
-            meta_entry["cr"] = layer_cr
-            meta_entry["n_original"] = n_orig
-            meta_entry["orig_shape"] = list(orig_shape)
-            q = q_packed
-        quantized_t[name] = q
-        scales_t[name] = s
-        dtypes_t[name] = str(t.dtype).removeprefix("torch.")
-        if meta_entry:
-            qmeta_t[name] = meta_entry
-        quant_payload += q.numel() * q.element_size() + s.numel() * s.element_size()
-    if hasattr(base_model, "_wte_rank1"):
-        u_cpu = base_model._wte_rank1["u"].detach().to("cpu")
-        v_cpu = base_model._wte_rank1["v"].detach().to("cpu")
-        u_store = u_cpu.to(INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-        v_store = v_cpu.to(INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-        passthrough_t["tok_emb_rank1_u"] = u_store
-        passthrough_t["tok_emb_rank1_v"] = v_store
-        passthrough_orig_dtypes_t["tok_emb_rank1_u"] = "float32"
-        passthrough_orig_dtypes_t["tok_emb_rank1_v"] = "float32"
-        quant_payload += u_store.numel() * u_store.element_size() + v_store.numel() * v_store.element_size()
-        log0(f"wte_rank1: stored u {tuple(u_store.shape)} + v {tuple(v_store.shape)} ({(u_store.numel() + v_store.numel()) * u_store.element_size()} bytes fp16)")
-    quant_obj = {"__quant_format__": f"gptq_sdclip_cr{cr}_per_row_v1", "quantized": quantized_t, "scales": scales_t, "dtypes": dtypes_t, "passthrough": passthrough_t}
-    if qmeta_t:
-        quant_obj["qmeta"] = qmeta_t
-    if passthrough_orig_dtypes_t:
-        quant_obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes_t
-    quant_buf = io.BytesIO(); torch.save(quant_obj, quant_buf); quant_raw = quant_buf.getvalue()
-    quant_blob = _compress(quant_raw)
-    if master_process:
-        with open("final_model.int6.ptz", "wb") as f: f.write(quant_blob)
-        qsz = os.path.getsize("final_model.int6.ptz")
-        code_bytes = code.encode("utf-8")
-        csz_raw = len(code_bytes)
-        _code_lzma = lzma.compress(code_bytes, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME}])
-        _code_b85 = base64.b85encode(_code_lzma)
-        _stub = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode(""),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))'
-        csz_submission = len(_code_b85) + len(_stub)
-        if os.environ.get("WRITE_COMPRESSED_SUBMISSION", "1") == "1":
-            _wrapper = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode(' + _code_b85 + b'),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))'
-            with open("submission.py", "wb") as f: f.write(_wrapper)
-        log0(f"Serialized model int6+{_COMPRESSOR}: {qsz} bytes (payload:{quant_payload} raw:{len(quant_raw)})")
-        log0(f"code: raw={csz_raw} compressed={csz_submission} (ratio={csz_submission/csz_raw:.2f})")
-        log0(f"Total submission size (raw code): {qsz + csz_raw} bytes")
-        log0(f"Total submission size (compressed code): {qsz + csz_submission} bytes")
-        if bool(int(os.environ.get("SKIP_EVAL_OVERSIZE", "0"))) and (qsz + csz_submission) > 16 * 1024 * 1024:
-            log0(f"SKIP_EVAL_OVERSIZE: artifact {qsz + csz_submission} > 16MB, skipping val eval")
-            sys.exit(0)
-    if distributed:
-        dist.barrier()
+                quant_payload += t.numel() * t.element_size()
+                continue
+            if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+                passthrough_t[name] = t.float().contiguous()
+                quant_payload += t.numel() * 4
+                continue
+            if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+                if any(p in name for p in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+                    passthrough_t[name] = t.float().contiguous()
+                elif t.dtype in {torch.float32, torch.bfloat16}:
+                    passthrough_orig_dtypes_t[name] = str(t.dtype).removeprefix("torch.")
+                    passthrough_t[name] = t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+                else:
+                    passthrough_t[name] = t
+                quant_payload += passthrough_t[name].numel() * passthrough_t[name].element_size()
+                continue
+            layer_cr = GPTQ_CR
+            if name in gptq_scales:
+                sf = gptq_scales[name].float()
+                t32 = t.float()
+                _cr = gptq_crs.get(name, GPTQ_CR)
+                layer_cr = _cr
+                q = torch.clamp(torch.round(t32 / sf[:, None]), -_cr, _cr).to(torch.int8).contiguous()
+                s = sf.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+            elif "tok_emb.weight" in name:
+                q, s = quantize_float_tensor_int6(t, bits=int(os.environ.get("EMB_BITS", "8")), sd_k=float(os.environ.get("EMB_CLIP_K", "12.85")))
+                layer_cr = (2 ** (int(os.environ.get("EMB_BITS", "8")) - 1)) - 1
+            else:
+                q, s = quantize_float_tensor_int6(t, bits=6)
+                layer_cr = 31
+            meta_entry: dict = {}
+            if s.ndim > 0:
+                meta_entry["scheme"] = "per_row"; meta_entry["axis"] = 0
+            if _BITPACK and layer_cr in (31, 63):
+                q_packed, n_orig, orig_shape = _bitpack_int(q, layer_cr)
+                meta_entry["bitpacked"] = True
+                meta_entry["cr"] = layer_cr
+                meta_entry["n_original"] = n_orig
+                meta_entry["orig_shape"] = list(orig_shape)
+                q = q_packed
+            quantized_t[name] = q
+            scales_t[name] = s
+            dtypes_t[name] = str(t.dtype).removeprefix("torch.")
+            if meta_entry:
+                qmeta_t[name] = meta_entry
+            quant_payload += q.numel() * q.element_size() + s.numel() * s.element_size()
+        if hasattr(base_model, "_wte_rank1"):
+            u_cpu = base_model._wte_rank1["u"].detach().to("cpu")
+            v_cpu = base_model._wte_rank1["v"].detach().to("cpu")
+            u_store = u_cpu.to(INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+            v_store = v_cpu.to(INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+            passthrough_t["tok_emb_rank1_u"] = u_store
+            passthrough_t["tok_emb_rank1_v"] = v_store
+            passthrough_orig_dtypes_t["tok_emb_rank1_u"] = "float32"
+            passthrough_orig_dtypes_t["tok_emb_rank1_v"] = "float32"
+            quant_payload += u_store.numel() * u_store.element_size() + v_store.numel() * v_store.element_size()
+            log0(f"wte_rank1: stored u {tuple(u_store.shape)} + v {tuple(v_store.shape)} ({(u_store.numel() + v_store.numel()) * u_store.element_size()} bytes fp16)")
+        quant_obj = {"__quant_format__": f"gptq_sdclip_cr{cr}_per_row_v1", "quantized": quantized_t, "scales": scales_t, "dtypes": dtypes_t, "passthrough": passthrough_t}
+        if qmeta_t:
+            quant_obj["qmeta"] = qmeta_t
+        if passthrough_orig_dtypes_t:
+            quant_obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes_t
+        quant_buf = io.BytesIO(); torch.save(quant_obj, quant_buf); quant_raw = quant_buf.getvalue()
+        quant_blob = _compress(quant_raw)
+        if master_process:
+            with open("final_model.int6.ptz", "wb") as f: f.write(quant_blob)
+            qsz = os.path.getsize("final_model.int6.ptz")
+            code_bytes = code.encode("utf-8")
+            csz_raw = len(code_bytes)
+            _code_lzma = lzma.compress(code_bytes, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME}])
+            _code_b85 = base64.b85encode(_code_lzma)
+            _stub = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode(""),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))'
+            csz_submission = len(_code_b85) + len(_stub)
+            if os.environ.get("WRITE_COMPRESSED_SUBMISSION", "1") == "1":
+                _wrapper = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode(' + _code_b85 + b'),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))'
+                with open("submission.py", "wb") as f: f.write(_wrapper)
+            log0(f"Serialized model int6+{_COMPRESSOR}: {qsz} bytes (payload:{quant_payload} raw:{len(quant_raw)})")
+            log0(f"code: raw={csz_raw} compressed={csz_submission} (ratio={csz_submission/csz_raw:.2f})")
+            log0(f"Total submission size (raw code): {qsz + csz_raw} bytes")
+            log0(f"Total submission size (compressed code): {qsz + csz_submission} bytes")
+            if bool(int(os.environ.get("SKIP_EVAL_OVERSIZE", "0"))) and (qsz + csz_submission) > 16 * 1024 * 1024:
+                log0(f"SKIP_EVAL_OVERSIZE: artifact {qsz + csz_submission} > 16MB, skipping val eval")
+                sys.exit(0)
+        if distributed:
+            dist.barrier()
 
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
