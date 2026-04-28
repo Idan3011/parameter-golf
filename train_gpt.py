@@ -39,21 +39,27 @@ import torch.nn.functional as F
 torch._dynamo.config.cache_size_limit = int(os.environ.get("DYNAMO_CACHE_SIZE", "64"))
 from torch import Tensor, nn
 try:
-    from flash_attn_interface import flash_attn_func
+    from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
     HAS_FA3 = True
+    HAS_FA3_VARLEN = True
 except ImportError:
     try:
         from flash_attn import flash_attn_func
         HAS_FA3 = True
     except ImportError:
         HAS_FA3 = False
+    HAS_FA3_VARLEN = False
 from torch.nn.parallel import DistributedDataParallel as DDP
+_VARLEN_ATTN = bool(int(os.environ.get("VARLEN_ATTN", "0"))) and HAS_FA3_VARLEN
+_FUSED_MLP = bool(int(os.environ.get("FUSED_MLP", "0")))
+_BOS_ID = int(os.environ.get("BOS_ID", "1"))
 _SKIP_LERP = bool(int(os.environ.get("SKIP_LERP", "1")))
 _SHD_DIM = int(os.environ.get("SHD_DIM", "16"))
 _WTE_RANK1 = bool(int(os.environ.get("WTE_RANK1", "1")))
 _ATTN_OUT_GATE = bool(int(os.environ.get("ATTN_OUT_GATE", "0")))
 _GATED_ATTN = bool(int(os.environ.get("GATED_ATTN", "0")))
 _SMEAR_GATE = bool(int(os.environ.get("SMEAR_GATE", "0")))
+_SMEAR_BOS_FIX = bool(int(os.environ.get("SMEAR_BOS_FIX", "0")))
 _MLP_GATE = bool(int(os.environ.get("MLP_GATE", "0")))
 _RECURRENCE_CURRICULUM = bool(int(os.environ.get("RECURRENCE_CURRICULUM", "0")))
 _LOOP_PHASE_DEPTHS = tuple(int(x) for x in os.environ.get("LOOP_PHASE_DEPTHS", "1,3,4").split(","))
@@ -120,15 +126,154 @@ class Hyperparameters:
     ttt_grad_clip = 1.0
     eval_hash_buckets = int(os.environ.get("EVAL_HASH_BUCKETS", "16384"))
 
+_PE_COEFFS = (
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+)
+_POLAR_NS = bool(int(os.environ.get("POLAR_NS", "0")))
+
+def _next_multiple(x, n):
+    return ((x + n - 1) // n) * n
+
+def _build_cu_seqlens(bos_pos, total_len, device, max_doc_len=0, bucket_size=64):
+    if not bos_pos or bos_pos[0] != 0:
+        bos_pos = [0] + list(bos_pos)
+    seg_starts = []
+    starts_with_end = bos_pos + [total_len]
+    for i in range(len(starts_with_end) - 1):
+        start = starts_with_end[i]
+        end = starts_with_end[i + 1]
+        if max_doc_len > 0:
+            pos = start
+            while pos < end:
+                seg_starts.append(pos)
+                pos += max_doc_len
+        else:
+            seg_starts.append(start)
+    boundaries = seg_starts + [total_len]
+    padded_len = _next_multiple(len(boundaries), bucket_size)
+    cu = torch.full((padded_len,), total_len, dtype=torch.int32, device=device)
+    cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
+    seg_ends = seg_starts[1:] + [total_len]
+    max_seqlen = max(end - start for start, end in zip(seg_starts, seg_ends))
+    return cu, int(max_seqlen)
+
+if _FUSED_MLP:
+    import triton
+    import triton.language as tl
+    try:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+        HAS_TMA = True
+    except ImportError:
+        HAS_TMA = False
+    if HAS_TMA:
+        @triton.jit
+        def _fused_llrelu_sq_kernel(a_desc, b_desc, c_desc, aux_desc, M, N, K,
+                                    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                    BLOCK_SIZE_K: tl.constexpr, NUM_SMS: tl.constexpr,
+                                    FORWARD: tl.constexpr):
+            dtype = tl.bfloat16
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            num_tiles = num_pid_m * num_pid_n
+            tile_id_c = start_pid - NUM_SMS
+            for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+                pid_m = tile_id // num_pid_n
+                pid_n = tile_id % num_pid_n
+                offs_am = pid_m * BLOCK_SIZE_M
+                offs_bn = pid_n * BLOCK_SIZE_N
+                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+                for ki in range(k_tiles):
+                    offs_k = ki * BLOCK_SIZE_K
+                    a = a_desc.load([offs_am, offs_k])
+                    b = b_desc.load([offs_bn, offs_k])
+                    accumulator = tl.dot(a, b.T, accumulator)
+                tile_id_c += NUM_SMS
+                offs_am_c = offs_am
+                offs_bn_c = offs_bn
+                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+                acc = tl.permute(acc, (0, 2, 1))
+                acc0, acc1 = tl.split(acc)
+                c0 = acc0.to(dtype)
+                c1 = acc1.to(dtype)
+                if not FORWARD:
+                    pre0 = aux_desc.load([offs_am_c, offs_bn_c])
+                    pre1 = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+                    c0 = c0 * tl.where(pre0 > 0, 2.0 * pre0, 0.5 * pre0)
+                    c1 = c1 * tl.where(pre1 > 0, 2.0 * pre1, 0.5 * pre1)
+                c_desc.store([offs_am_c, offs_bn_c], c0)
+                c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+                if FORWARD:
+                    aux0 = tl.where(c0 > 0, c0, 0.5 * c0)
+                    aux1 = tl.where(c1 > 0, c1, 0.5 * c1)
+                    aux_desc.store([offs_am_c, offs_bn_c], aux0 * aux0)
+                    aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], aux1 * aux1)
+        def _fused_llrelu_sq(a, b, aux=None):
+            M, K = a.shape
+            N, K2 = b.shape
+            assert K == K2
+            c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+            forward = aux is None
+            if aux is None:
+                aux = torch.empty((M, N), device=a.device, dtype=a.dtype)
+            num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 256, 64
+            num_stages = 4 if forward else 3
+            a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+            b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+            c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+            aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+            grid = lambda _meta: (min(num_sms, triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)),)
+            _fused_llrelu_sq_kernel[grid](a_desc, b_desc, c_desc, aux_desc, M, N, K,
+                                          BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                          BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_SMS=num_sms,
+                                          FORWARD=forward, num_stages=num_stages, num_warps=8)
+            if forward: return c, aux
+            return c
+        class _FusedLinearLeakyReLUSquare(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, w1, w2):
+                x_flat = x.reshape(-1, x.shape[-1])
+                pre, post = _fused_llrelu_sq(x_flat, w1)
+                out = F.linear(post, w2)
+                ctx.save_for_backward(x, w1, w2, pre, post)
+                return out.view(*x.shape[:-1], out.shape[-1])
+            @staticmethod
+            def backward(ctx, grad_output):
+                x, w1, w2, pre, post = ctx.saved_tensors
+                x_flat = x.reshape(-1, x.shape[-1])
+                grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
+                dw2 = grad_output_flat.T @ post
+                dpre = _fused_llrelu_sq(grad_output_flat, w2.T.contiguous(), aux=pre)
+                dw1 = dpre.T @ x_flat
+                dx = dpre @ w1
+                return dx.view_as(x), dw1, dw2
+        fused_leaky_relu_sq_mlp = _FusedLinearLeakyReLUSquare.apply
+    else:
+        fused_leaky_relu_sq_mlp = None
+else:
+    fused_leaky_relu_sq_mlp = None
+
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
     X = G.bfloat16()
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    A = X @ X.T; s = (A.abs().sum(dim=-1) + eps).rsqrt(); X = s.unsqueeze(-1) * X
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    for _ in range(steps):
-        A = X @ X.T; B = b * A + c * A @ A; X = a * X + B @ X
+    if _POLAR_NS:
+        X = X / (X.norm() + eps)
+        coeffs = _PE_COEFFS[:steps] if steps <= len(_PE_COEFFS) else _PE_COEFFS
+        for a, b, c in coeffs:
+            A = X @ X.T; B = b * A + c * (A @ A); X = a * X + B @ X
+    else:
+        A = X @ X.T; s = (A.abs().sum(dim=-1) + eps).rsqrt(); X = s.unsqueeze(-1) * X
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        for _ in range(steps):
+            A = X @ X.T; B = b * A + c * A @ A; X = a * X + B @ X
     return X.T if transposed else X
 
 _H5_ASYNC_AR = bool(int(os.environ.get("H5_ASYNC_AR", "1")))
@@ -472,6 +617,31 @@ def quantize_float_tensor_int6(t: Tensor, bits: int = 6, sd_k: float = 12.85) ->
     q = torch.clamp(torch.round(t32 / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
+_LQER_ENABLED = bool(int(os.environ.get("LQER_ENABLED", "0")))
+_LQER_RANK = int(os.environ.get("LQER_RANK", "4"))
+_LQER_TOP_K = int(os.environ.get("LQER_TOP_K", "5"))
+_LQER_FACTOR_BITS = int(os.environ.get("LQER_FACTOR_BITS", "4"))
+_LQER_ASYM_ENABLED = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
+_LQER_ASYM_GROUP = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+_LQER_EXCLUDE_TOK_EMB = bool(int(os.environ.get("LQER_EXCLUDE_TOK_EMB", "1")))
+
+def _lqer_pack(A: Tensor, B: Tensor, bits: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    rng = 2 ** (bits - 1) - 1
+    sA = (A.abs().amax(dim=1).clamp_min(1e-10) / rng).to(torch.float16)
+    sB = (B.abs().amax(dim=1).clamp_min(1e-10) / rng).to(torch.float16)
+    qA = torch.clamp(torch.round(A / sA.float().view(-1, 1)), -rng, rng).to(torch.int8)
+    qB = torch.clamp(torch.round(B / sB.float().view(-1, 1)), -rng, rng).to(torch.int8)
+    return qA, sA, qB, sB
+
+def _lqer_pack_asym(A: Tensor, B: Tensor, g: int = 64) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    sA = (A.abs().amax().clamp_min(1e-10) / 1.5).to(torch.float16)
+    qA = torch.clamp(torch.round(A / sA.float()), -2, 1).to(torch.int8)
+    Bf = B.reshape(-1, g)
+    Bmax = Bf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    sB = (Bmax / 7.5).to(torch.float16).reshape(-1)
+    qB = torch.clamp(torch.round(Bf / sB.float().reshape(-1, 1)), -8, 7).to(torch.int8).reshape(B.shape)
+    return qA, sA, qB, sB
+
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
@@ -496,6 +666,23 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         v = out.pop("tok_emb_rank1_v").float()
         target_dtype = out["tok_emb.weight"].dtype
         out["tok_emb.weight"] = (out["tok_emb.weight"].float() + u[:, None] * v[None, :]).to(dtype=target_dtype)
+    lqer_meta = obj.get("lqer_meta", {})
+    lqer_blobs = obj.get("lqer_blobs", {})
+    for name, kind in lqer_meta.items():
+        if name not in out:
+            continue
+        target_dtype = out[name].dtype
+        if kind == "asym":
+            qA = lqer_blobs[name + ".lqA_a"].float() * float(lqer_blobs[name + ".lqAs_a"])
+            qB_t = lqer_blobs[name + ".lqB_a"]
+            sB_t = lqer_blobs[name + ".lqBs_a"]
+            g_sz = qB_t.numel() // sB_t.numel()
+            qB = (qB_t.reshape(-1, g_sz).float() * sB_t.float().view(-1, 1)).reshape(qB_t.shape)
+            out[name] = (out[name].float() + qA @ qB).to(dtype=target_dtype)
+        else:
+            qA = lqer_blobs[name + ".lqA"].float() * lqer_blobs[name + ".lqAs"].float().view(-1, 1)
+            qB = lqer_blobs[name + ".lqB"].float() * lqer_blobs[name + ".lqBs"].float().view(-1, 1)
+            out[name] = (out[name].float() + qA @ qB).to(dtype=target_dtype)
     return out
 
 def generate_ar_calibration(model: nn.Module, device: torch.device, vocab_size: int = 1024,
@@ -733,6 +920,21 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+    def next_batch_varlen(self, global_tokens: int, grad_accum_steps: int) -> tuple[Tensor, Tensor, Tensor, int]:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        x_flat = local[:-1].unsqueeze(0)
+        y_flat = local[1:].unsqueeze(0)
+        bos_pos = (x_flat[0] == _BOS_ID).nonzero(as_tuple=True)[0].cpu().tolist()
+        cu_seqlens, max_seqlen = _build_cu_seqlens(bos_pos, x_flat.shape[1], torch.device("cpu"))
+        return (x_flat.to(self.device, non_blocking=True),
+                y_flat.to(self.device, non_blocking=True),
+                cu_seqlens.to(self.device, non_blocking=True),
+                max_seqlen)
+
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -806,7 +1008,8 @@ class CausalSelfAttention(nn.Module):
         if _GATED_ATTN:
             self.gated_attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None,
+                cu_seqlens: Tensor | None = None, max_seqlen: int = 0) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
         x_orig = x
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
@@ -822,7 +1025,14 @@ class CausalSelfAttention(nn.Module):
             q = torch.cat([q[..., :-_SHD_DIM], q_shared], dim=-1)
             k_shared = k[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).expand(-1, -1, k.size(-2), -1)
             k = torch.cat([k[..., :-_SHD_DIM], k_shared], dim=-1)
-        if HAS_FA3:
+        if cu_seqlens is not None and HAS_FA3_VARLEN and bsz == 1:
+            y = flash_attn_varlen_func(
+                q[0], k[0], v[0],
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                causal=True,
+            )[None]
+        elif HAS_FA3:
             y = flash_attn_func(q, k, v, causal=True)
         else:
             y = F.scaled_dot_product_attention(
@@ -854,6 +1064,8 @@ class MLP(nn.Module):
         self._leaky = leaky
 
     def forward(self, x: Tensor) -> Tensor:
+        if _FUSED_MLP and fused_leaky_relu_sq_mlp is not None and self._leaky and self.training:
+            return fused_leaky_relu_sq_mlp(x, self.fc.weight.to(x.dtype), self.proj.weight.to(x.dtype))
         fc_out = self.fc(x)
         x = F.leaky_relu(fc_out, 0.5) if self._leaky else torch.relu(fc_out)
         return self.proj(x.square())
@@ -884,12 +1096,13 @@ class Block(nn.Module):
             self.mlp_gate = CastedLinear(12, 1, bias=False)
             nn.init.zeros_(self.mlp_gate.weight)
 
-    def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None,
+                cu_seqlens: Tensor | None = None, max_seqlen: int = 0) -> tuple[Tensor, Tensor]:
         mix_a, mix_b = self.resid_mix.to(dtype=x.dtype).unbind(0)
         x = mix_a * x + mix_b * x0
         pre = self._ln_pre_scale
         post = self._ln_post_scale
-        attn_out, v = self.attn(pre * self.attn_norm(x), cos, sin, v0)
+        attn_out, v = self.attn(pre * self.attn_norm(x), cos, sin, v0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         if _MLP_GATE:
             mlp_g = (2.0 * torch.sigmoid(self.mlp_gate(x[:, :, :12]))).contiguous()
         if self.parallel_residual:
@@ -968,12 +1181,12 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
+    def _run_blocks(self, x: Tensor, x0: Tensor, cu_seqlens: Tensor | None = None, max_seqlen: int = 0) -> Tensor:
         cos, sin = self.rotary(x.size(1), x.device, x.dtype)
         v0 = None
         skips: list[Tensor] = []
         for block_idx in self.encoder_indices:
-            x, v = self.blocks[block_idx](x, x0, cos, sin, v0)
+            x, v = self.blocks[block_idx](x, x0, cos, sin, v0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             if v0 is None:
                 v0 = v
             skips.append(x)
@@ -986,7 +1199,7 @@ class GPT(nn.Module):
                     x = torch.lerp(s_w, x, gate)
                 else:
                     x = x + gate * s_w
-            x, _ = self.blocks[block_idx](x, x0, cos, sin, v0)
+            x, _ = self.blocks[block_idx](x, x0, cos, sin, v0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         return x
 
     def _compute_logits(self, x: Tensor) -> Tensor:
@@ -996,7 +1209,8 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor | None = None,
+                cu_seqlens: Tensor | None = None, max_seqlen: int = 0) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.eval_hash_emb is not None:
             prev = torch.cat([input_ids[:, :1], input_ids[:, :-1]], dim=1)
@@ -1007,8 +1221,11 @@ class GPT(nn.Module):
             gate_in = x[:, :, :12].contiguous()
             gate = torch.sigmoid(self.smear_gate(gate_in))
             prev_x = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
-            x = x + self.smear_lambda.to(dtype=x.dtype) * gate * prev_x
-        x = self._run_blocks(x, x)
+            smear_contrib = self.smear_lambda.to(dtype=x.dtype) * gate * prev_x
+            if _SMEAR_BOS_FIX:
+                smear_contrib = smear_contrib.masked_fill((input_ids == 1).unsqueeze(-1), 0.0)
+            x = x + smear_contrib
+        x = self._run_blocks(x, x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = self.final_norm(x)
         logits = self._compute_logits(x)
         if target_ids is None:
@@ -1192,7 +1409,10 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         remaining_frac = remaining_ms / max(max_wallclock_ms, 1.0)
         warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", "0.72"))
-        return min(remaining_frac / warmdown_frac, 1.0) if remaining_frac < warmdown_frac else 1.0
+        min_lr = float(os.environ.get("MIN_LR", "0.0"))
+        if remaining_frac >= warmdown_frac:
+            return 1.0
+        return max(remaining_frac / warmdown_frac, min_lr)
     _skip_train = bool(int(os.environ.get("SKIP_TRAIN", "0")))
     _load_float_pt = os.environ.get("LOAD_FLOAT_PT", "")
     _skip_quant_early = bool(int(os.environ.get("SKIP_QUANT", "0")))
@@ -1224,9 +1444,14 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                _pw_x, _pw_y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    _pw_loss = model(_pw_x, _pw_y)
+                if _VARLEN_ATTN:
+                    _pw_x, _pw_y, _pw_cu, _pw_ms = train_loader.next_batch_varlen(args.train_batch_tokens, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        _pw_loss = model(_pw_x, _pw_y, cu_seqlens=_pw_cu, max_seqlen=_pw_ms)
+                else:
+                    _pw_x, _pw_y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        _pw_loss = model(_pw_x, _pw_y)
                 (_pw_loss * grad_scale).backward()
             for opt in optimizers: opt.step()
             zero_grad_all()
@@ -1244,9 +1469,14 @@ def main() -> None:
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                if _VARLEN_ATTN:
+                    x, y, _wu_cu, _wu_ms = train_loader.next_batch_varlen(args.train_batch_tokens, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        warmup_loss = model(x, y, cu_seqlens=_wu_cu, max_seqlen=_wu_ms)
+                else:
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers: opt.step()
             zero_grad_all()
@@ -1320,9 +1550,14 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+            if _VARLEN_ATTN:
+                x, y, _tr_cu, _tr_ms = train_loader.next_batch_varlen(args.train_batch_tokens, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y, cu_seqlens=_tr_cu, max_seqlen=_tr_ms)
+            else:
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1434,6 +1669,7 @@ def main() -> None:
         passthrough_t: dict[str, Tensor] = {}
         passthrough_orig_dtypes_t: dict[str, str] = {}
         qmeta_t: dict[str, dict] = {}
+        lqer_cands: dict[str, tuple[Tensor, float]] = {}
         quant_payload = 0
         for name, tensor in export_sd.items():
             t = tensor.detach().to("cpu").contiguous()
@@ -1478,6 +1714,11 @@ def main() -> None:
             if meta_entry:
                 qmeta_t[name] = meta_entry
             quant_payload += q.numel() * q.element_size() + s.numel() * s.element_size()
+            if _LQER_ENABLED and q.ndim == 2 and s.ndim > 0:
+                if not (_LQER_EXCLUDE_TOK_EMB and "tok_emb" in name):
+                    W_q = q.float() * s.float().view(-1, 1)
+                    E = t.float() - W_q
+                    lqer_cands[name] = (E, float(E.norm()))
         if hasattr(base_model, "_wte_rank1"):
             u_cpu = base_model._wte_rank1["u"].detach().to("cpu")
             v_cpu = base_model._wte_rank1["v"].detach().to("cpu")
@@ -1489,11 +1730,40 @@ def main() -> None:
             passthrough_orig_dtypes_t["tok_emb_rank1_v"] = "float32"
             quant_payload += u_store.numel() * u_store.element_size() + v_store.numel() * v_store.element_size()
             log0(f"wte_rank1: stored u {tuple(u_store.shape)} + v {tuple(v_store.shape)} ({(u_store.numel() + v_store.numel()) * u_store.element_size()} bytes fp16)")
+        lqer_meta_t: dict[str, str] = {}
+        lqer_blobs_t: dict[str, Tensor] = {}
+        if _LQER_ENABLED and lqer_cands:
+            top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[:_LQER_TOP_K]
+            for lqer_name, (E, norm) in top:
+                U, S_, Vh = torch.linalg.svd(E.float(), full_matrices=False)
+                r = min(_LQER_RANK, S_.numel())
+                A = (U[:, :r] * S_[:r]).contiguous()
+                B = Vh[:r, :].contiguous()
+                if _LQER_ASYM_ENABLED and B.numel() % _LQER_ASYM_GROUP == 0:
+                    qA, sA, qB, sB = _lqer_pack_asym(A, B, _LQER_ASYM_GROUP)
+                    lqer_blobs_t[lqer_name + ".lqA_a"] = qA
+                    lqer_blobs_t[lqer_name + ".lqAs_a"] = sA
+                    lqer_blobs_t[lqer_name + ".lqB_a"] = qB
+                    lqer_blobs_t[lqer_name + ".lqBs_a"] = sB
+                    lqer_meta_t[lqer_name] = "asym"
+                else:
+                    qA, sA, qB, sB = _lqer_pack(A, B, _LQER_FACTOR_BITS)
+                    lqer_blobs_t[lqer_name + ".lqA"] = qA
+                    lqer_blobs_t[lqer_name + ".lqAs"] = sA
+                    lqer_blobs_t[lqer_name + ".lqB"] = qB
+                    lqer_blobs_t[lqer_name + ".lqBs"] = sB
+                    lqer_meta_t[lqer_name] = "sym"
+                _lqer_bytes = sum(b.numel() * b.element_size() for b in (qA, sA, qB, sB))
+                quant_payload += _lqer_bytes
+                log0(f"lqer: {lqer_name} ({lqer_meta_t[lqer_name]}, r={r}) ||E||={norm:.3f} → {_lqer_bytes} bytes")
         quant_obj = {"__quant_format__": f"gptq_sdclip_cr{cr}_per_row_v1", "quantized": quantized_t, "scales": scales_t, "dtypes": dtypes_t, "passthrough": passthrough_t}
         if qmeta_t:
             quant_obj["qmeta"] = qmeta_t
         if passthrough_orig_dtypes_t:
             quant_obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes_t
+        if lqer_meta_t:
+            quant_obj["lqer_meta"] = lqer_meta_t
+            quant_obj["lqer_blobs"] = lqer_blobs_t
         quant_buf = io.BytesIO(); torch.save(quant_obj, quant_buf); quant_raw = quant_buf.getvalue()
         quant_blob = _compress(quant_raw)
         if master_process:
