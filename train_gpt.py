@@ -51,6 +51,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 _SKIP_LERP = bool(int(os.environ.get("SKIP_LERP", "1")))
 _SHD_DIM = int(os.environ.get("SHD_DIM", "16"))
 _WTE_RANK1 = bool(int(os.environ.get("WTE_RANK1", "1")))
+_ATTN_OUT_GATE = bool(int(os.environ.get("ATTN_OUT_GATE", "0")))
+_GATED_ATTN = bool(int(os.environ.get("GATED_ATTN", "0")))
+_SMEAR_GATE = bool(int(os.environ.get("SMEAR_GATE", "0")))
+_MLP_GATE = bool(int(os.environ.get("MLP_GATE", "0")))
+_RECURRENCE_CURRICULUM = bool(int(os.environ.get("RECURRENCE_CURRICULUM", "0")))
+_LOOP_PHASE_DEPTHS = tuple(int(x) for x in os.environ.get("LOOP_PHASE_DEPTHS", "1,3,4").split(","))
+_FUSED_MUON = bool(int(os.environ.get("FUSED_MUON", "0")))
 _RECUR_INT7 = bool(int(os.environ.get("RECUR_INT7", "0")))
 
 class Hyperparameters:
@@ -94,7 +101,8 @@ class Hyperparameters:
     beta2 = 0.95
     adam_eps = 1e-8
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", "0.3"))
-    muon_wd = 0.095
+    muon_wd = float(os.environ.get("MUON_WD", "0.095"))
+    muon_wd_mlp = float(os.environ.get("MUON_WD_MLP", "0.095"))
     muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
     adam_wd = float(os.environ.get("ADAM_WD", "0.02"))
     embed_wd = float(os.environ.get("EMBED_WD", "0.085"))
@@ -123,15 +131,28 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) ->
         A = X @ X.T; B = b * A + c * A @ A; X = a * X + B @ X
     return X.T if transposed else X
 
-_H5_ASYNC_AR = bool(int(os.environ.get("H5_ASYNC_AR", "1"))) 
+_H5_ASYNC_AR = bool(int(os.environ.get("H5_ASYNC_AR", "1")))
 _H5_BUCKET_MB = float(os.environ.get("H5_BUCKET_MB", "10"))
+
+def _muon_param_transform(g, momentum_buf, momentum, nesterov, row_normalize, backend_steps):
+    momentum_buf.mul_(momentum).add_(g)
+    if nesterov:
+        g = g.add(momentum_buf, alpha=momentum)
+    if row_normalize:
+        row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
+        g = g / row_norms.to(g.dtype)
+    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+    g = g * max(1, g.size(0) / g.size(1)) ** 0.5
+    return g
+
+if _FUSED_MUON:
+    _muon_param_transform = torch.compile(_muon_param_transform, dynamic=False, fullgraph=True)
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, wd: float = 0.0, row_normalize: bool = False):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, wd=wd, row_normalize=row_normalize))
-        self._updates_flat: Tensor | None = None
-        self._param_views: list[Tensor] | None = None
+        self._group_states: dict[int, dict] = {}
         self._lr_scales: list[float] | None = None
-        self._bucket_boundaries: list[tuple[int, int]] | None = None
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -140,20 +161,23 @@ class Muon(torch.optim.Optimizer):
         distributed = dist.is_available() and dist.is_initialized()
         world_size = dist.get_world_size() if distributed else 1
         rank = dist.get_rank() if distributed else 0
+        global_param_idx = 0
         for group in self.param_groups:
             params = group["params"]
             if not params: continue
             lr, momentum, backend_steps = group["lr"], group["momentum"], group["backend_steps"]
             nesterov, wd = group["nesterov"], group["wd"]
             row_normalize = group.get("row_normalize", False)
-            if self._updates_flat is None:
+            gid = id(group)
+            gs = self._group_states.get(gid)
+            if gs is None:
                 total = sum(int(p.numel()) for p in params)
-                self._updates_flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
+                updates_flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
                 views, c = [], 0
                 for p in params:
-                    views.append(self._updates_flat[c : c + p.numel()].view_as(p))
+                    views.append(updates_flat[c : c + p.numel()].view_as(p))
                     c += p.numel()
-                self._param_views = views
+                bucket_boundaries = None
                 if _H5_ASYNC_AR and distributed:
                     bucket_elems = max(1, int(_H5_BUCKET_MB * 1024 * 1024 / 2))
                     boundaries, bstart, cpos = [], 0, 0
@@ -162,9 +186,14 @@ class Muon(torch.optim.Optimizer):
                         if cpos - bstart >= bucket_elems:
                             boundaries.append((bstart, cpos)); bstart = cpos
                     if bstart < cpos: boundaries.append((bstart, cpos))
-                    self._bucket_boundaries = boundaries
-            self._updates_flat.zero_()
-            use_async_ar = _H5_ASYNC_AR and distributed and self._bucket_boundaries is not None
+                    bucket_boundaries = boundaries
+                gs = {"updates_flat": updates_flat, "views": views, "bucket_boundaries": bucket_boundaries}
+                self._group_states[gid] = gs
+            updates_flat = gs["updates_flat"]
+            views = gs["views"]
+            bucket_boundaries = gs["bucket_boundaries"]
+            updates_flat.zero_()
+            use_async_ar = _H5_ASYNC_AR and distributed and bucket_boundaries is not None
             ar_handles: list = []
             next_bucket_idx = 0
             curr = 0
@@ -175,28 +204,23 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if "momentum_buffer" not in state: state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov: g = g.add(buf, alpha=momentum)
-                    if row_normalize:
-                        row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
-                        g = g / row_norms.to(g.dtype)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    if self._lr_scales is not None: g *= self._lr_scales[i]
-                    self._updates_flat[curr : param_end] = g.reshape(-1)
+                    g = _muon_param_transform(g, buf, momentum, nesterov, row_normalize, backend_steps)
+                    if self._lr_scales is not None: g = g * self._lr_scales[global_param_idx + i]
+                    updates_flat[curr : param_end] = g.reshape(-1)
                 curr = param_end
                 if use_async_ar:
-                    while (next_bucket_idx < len(self._bucket_boundaries)
-                           and self._bucket_boundaries[next_bucket_idx][1] <= curr):
-                        bstart, bend = self._bucket_boundaries[next_bucket_idx]
-                        ar_handles.append(dist.all_reduce(self._updates_flat[bstart:bend], op=dist.ReduceOp.SUM, async_op=True))
+                    while (next_bucket_idx < len(bucket_boundaries)
+                           and bucket_boundaries[next_bucket_idx][1] <= curr):
+                        bstart, bend = bucket_boundaries[next_bucket_idx]
+                        ar_handles.append(dist.all_reduce(updates_flat[bstart:bend], op=dist.ReduceOp.SUM, async_op=True))
                         next_bucket_idx += 1
             if use_async_ar:
                 for h in ar_handles: h.wait()
             elif distributed:
-                dist.all_reduce(self._updates_flat, op=dist.ReduceOp.SUM)
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             if wd > 0: torch._foreach_mul_(params, 1.0 - lr * wd)
-            torch._foreach_add_(params, self._param_views, alpha=-lr)
+            torch._foreach_add_(params, views, alpha=-lr)
+            global_param_idx += len(params)
         return loss
 
 def build_sentencepiece_luts(
@@ -427,6 +451,7 @@ def eval_val_sliding(args: Hyperparameters, model: nn.Module, rank: int, world_s
     return float(val_loss), float(bpb)
 CONTROL_TENSOR_NAME_PATTERNS = (
     "attn_scale", "mlp_scale", "resid_mix", "q_gain", "skip_weights", "skip_gates",
+    "attn_out_gate", "gated_attn_scale", "smear_gate", "smear_lambda", "mlp_gate",
 )
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = CONTROL_TENSOR_NAME_PATTERNS
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
@@ -775,9 +800,15 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.use_xsa = use_xsa
+        if _ATTN_OUT_GATE:
+            self.attn_out_gate = CastedLinear(12, num_heads, bias=False)
+            nn.init.zeros_(self.attn_out_gate.weight)
+        if _GATED_ATTN:
+            self.gated_attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
+        x_orig = x
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -787,9 +818,9 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         if _SHD_DIM > 0 and _SHD_DIM < self.head_dim:
-            q_shared = q[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).detach().expand(-1, -1, q.size(-2), -1)
+            q_shared = q[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).expand(-1, -1, q.size(-2), -1)
             q = torch.cat([q[..., :-_SHD_DIM], q_shared], dim=-1)
-            k_shared = k[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).detach().expand(-1, -1, k.size(-2), -1)
+            k_shared = k[..., -_SHD_DIM:].mean(dim=-2, keepdim=True).expand(-1, -1, k.size(-2), -1)
             k = torch.cat([k[..., :-_SHD_DIM], k_shared], dim=-1)
         if HAS_FA3:
             y = flash_attn_func(q, k, v, causal=True)
@@ -804,7 +835,13 @@ class CausalSelfAttention(nn.Module):
             vn = F.normalize(v, dim=-1)[:, :, :, None, :]
             proj = (y_kv * vn).sum(dim=-1, keepdim=True)
             y = (y_kv - proj * vn).flatten(2, 3)
+        if _ATTN_OUT_GATE:
+            gate_in = x_orig[:, :, :12].contiguous()
+            gate = (2.0 * torch.sigmoid(self.attn_out_gate(gate_in))).contiguous()
+            y = y * gate.unsqueeze(-1)
         y = y.reshape(bsz, seqlen, dim)
+        if _GATED_ATTN:
+            y = y * self.gated_attn_scale.to(dtype=y.dtype)[None, None, :]
         return self.proj(y), v
 
 class MLP(nn.Module):
@@ -843,6 +880,9 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if _MLP_GATE:
+            self.mlp_gate = CastedLinear(12, 1, bias=False)
+            nn.init.zeros_(self.mlp_gate.weight)
 
     def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix_a, mix_b = self.resid_mix.to(dtype=x.dtype).unbind(0)
@@ -850,12 +890,19 @@ class Block(nn.Module):
         pre = self._ln_pre_scale
         post = self._ln_post_scale
         attn_out, v = self.attn(pre * self.attn_norm(x), cos, sin, v0)
+        if _MLP_GATE:
+            mlp_g = (2.0 * torch.sigmoid(self.mlp_gate(x[:, :, :12]))).contiguous()
         if self.parallel_residual:
             mlp_out = self.mlp(pre * self.mlp_norm(x))
+            if _MLP_GATE:
+                mlp_out = mlp_out * mlp_g
             x = x + post * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out + post * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         else:
             x = x + post * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-            x = x + post * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(pre * self.mlp_norm(x))
+            mlp_out = self.mlp(pre * self.mlp_norm(x))
+            if _MLP_GATE:
+                mlp_out = mlp_out * mlp_g
+            x = x + post * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x, v
 
 class GPT(nn.Module):
@@ -891,6 +938,10 @@ class GPT(nn.Module):
         self.decoder_indices = self._looped_dec
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
+        if _SMEAR_GATE:
+            self.smear_gate = CastedLinear(12, 1, bias=False)
+            nn.init.zeros_(self.smear_gate.weight)
+            self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         _head_dim = model_dim // num_heads
         _rope_dims_env = int(os.environ.get("ROPE_DIMS", "16"))
         _rope_dims = _rope_dims_env if 0 < _rope_dims_env < _head_dim else None
@@ -952,6 +1003,11 @@ class GPT(nn.Module):
             hash_ids = (prev.long() * self.eval_hash_multiplier + input_ids.long()) % self.eval_hash_emb.num_embeddings
             x = x + self.eval_hash_emb(hash_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
+        if _SMEAR_GATE:
+            gate_in = x[:, :, :12].contiguous()
+            gate = torch.sigmoid(self.smear_gate(gate_in))
+            prev_x = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+            x = x + self.smear_lambda.to(dtype=x.dtype) * gate * prev_x
         x = self._run_blocks(x, x)
         x = self.final_norm(x)
         logits = self._compute_logits(x)
@@ -1069,6 +1125,8 @@ def main() -> None:
     _rec_idx = {str(i) for i in range(args.loop_start, args.loop_end + 1)}
     def _is_rec(n): return n.split(".", 1)[0] in _rec_idx
     matrix_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
+    matrix_attn_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and ".mlp." not in name]
+    matrix_mlp_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and ".mlp." in name]
     if _depth_lr:
         _rec_matrix = [p for name, p in block_named_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and _is_rec(name)]
         _nonrec_matrix = [p for p in matrix_params if not any(p is r for r in _rec_matrix)]
@@ -1077,6 +1135,9 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     if base_model.skip_gates.numel() > 0:
         scalar_params.append(base_model.skip_gates)
+    if _SMEAR_GATE and hasattr(base_model, 'smear_gate'):
+        scalar_params.append(base_model.smear_gate.weight)
+        scalar_params.append(base_model.smear_lambda)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     _telr = os.environ.get("TIED_EMBED_LR_VALUE", "")
     if _telr:
@@ -1086,7 +1147,15 @@ def main() -> None:
         betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.embed_wd, fused=True)
     _mlr = float(os.environ.get("MATRIX_LR_VALUE", args.matrix_lr))
     if _mlr != args.matrix_lr: log0(f"matrix_lr_override: lr={_mlr:.4f} (was {args.matrix_lr})")
-    optimizer_muon = Muon(matrix_params, lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd, row_normalize=args.muon_row_normalize)
+    if args.muon_wd_mlp != args.muon_wd:
+        optimizer_muon = Muon(
+            [{"params": matrix_attn_params, "wd": args.muon_wd},
+             {"params": matrix_mlp_params, "wd": args.muon_wd_mlp}],
+            lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
+            wd=args.muon_wd, row_normalize=args.muon_row_normalize)
+        log0(f"split_muon_wd: attn={args.muon_wd} ({len(matrix_attn_params)} params) mlp={args.muon_wd_mlp} ({len(matrix_mlp_params)} params)")
+    else:
+        optimizer_muon = Muon(matrix_params, lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd, row_normalize=args.muon_row_normalize)
     for g in optimizer_muon.param_groups: g["base_lr"] = _mlr
     if _depth_lr:
         _rec_set = set(id(p) for p in _rec_matrix); _dlf = float(os.environ.get("DEPTH_LR_FACTOR", "0.85"))
