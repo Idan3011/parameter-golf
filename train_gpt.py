@@ -65,6 +65,7 @@ _RECURRENCE_CURRICULUM = bool(int(os.environ.get("RECURRENCE_CURRICULUM", "0")))
 _LOOP_PHASE_DEPTHS = tuple(int(x) for x in os.environ.get("LOOP_PHASE_DEPTHS", "1,3,4").split(","))
 _FUSED_MUON = bool(int(os.environ.get("FUSED_MUON", "0")))
 _RECUR_INT7 = bool(int(os.environ.get("RECUR_INT7", "0")))
+_TWO_LANE_ROUTING = bool(int(os.environ.get("TWO_LANE_ROUTING", "0")))
 
 class Hyperparameters:
     _vs = int(os.environ.get("VOCAB_SIZE", "9000"))
@@ -1162,6 +1163,15 @@ class GPT(nn.Module):
         parallel_start = 7
         self.parallel_start = parallel_start
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, num_kv_heads, mlp_mult, qk_gain_init, use_xsa=True, leaky=True, layer_idx=i, parallel_residual=(i >= parallel_start)) for i in range(num_layers)])
+        if _TWO_LANE_ROUTING:
+            _asym = torch.ones(num_layers, 2, 2, dtype=torch.float32)
+            _asym[:, 0, 0] = 1.3
+            _asym[:, 0, 1] = 0.7
+            _asym[:, 1, 0] = 0.7
+            _asym[:, 1, 1] = 1.3
+            self.parallel_post_lambdas = nn.Parameter(_asym)
+            self.parallel_resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1 ** 0.5, dtype=torch.float32))
+        self._two_lane_active = bool(_TWO_LANE_ROUTING)
         self.final_norm = RMSNorm()
         self.eval_hash_emb: nn.Embedding | None = None
         self.eval_hash_multiplier = 2039
@@ -1181,6 +1191,29 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _two_lane_block(self, block_idx: int, lane0: Tensor, lane1: Tensor, x0: Tensor,
+                        cos: Tensor, sin: Tensor, v0: Tensor | None,
+                        cu_seqlens: Tensor | None = None, max_seqlen: int = 0) -> tuple[Tensor, Tensor, Tensor]:
+        block = self.blocks[block_idx]
+        mix_a, mix_b = block.resid_mix.to(dtype=lane0.dtype).unbind(0)
+        pre = block._ln_pre_scale
+        post = block._ln_post_scale
+        attn_in = mix_a * lane0 + mix_b * x0
+        attn_out_raw, v = block.attn(pre * block.attn_norm(attn_in), cos, sin, v0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        attn_out = post * block.attn_scale.to(dtype=attn_out_raw.dtype)[None, None, :] * attn_out_raw
+        mlp_in = mix_a * lane1 + mix_b * x0
+        mlp_out_raw = block.mlp(pre * block.mlp_norm(mlp_in))
+        mlp_out = post * block.mlp_scale.to(dtype=mlp_out_raw.dtype)[None, None, :] * mlp_out_raw
+        ar = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        ap = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        lane0 = ar * lane0 + ap[0] * attn_out
+        lane1 = ar * lane1 + ap[1] * attn_out
+        mr = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        mp = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        lane0 = mr * lane0 + mp[0] * mlp_out
+        lane1 = mr * lane1 + mp[1] * mlp_out
+        return lane0, lane1, v
+
     def _run_blocks(self, x: Tensor, x0: Tensor, cu_seqlens: Tensor | None = None, max_seqlen: int = 0) -> Tensor:
         cos, sin = self.rotary(x.size(1), x.device, x.dtype)
         v0 = None
@@ -1190,16 +1223,39 @@ class GPT(nn.Module):
             if v0 is None:
                 v0 = v
             skips.append(x)
+        use_two_lane = _TWO_LANE_ROUTING and getattr(self, '_two_lane_active', False) and hasattr(self, 'parallel_post_lambdas')
+        psl = self.parallel_start
+        lane0: Tensor | None = None
+        lane1: Tensor | None = None
         for dec_step, block_idx in enumerate(self.decoder_indices):
             if dec_step < self.num_skip_weights and skips:
-                w = self.skip_weights[dec_step].to(dtype=x.dtype)[None, None, :]
-                gate = torch.sigmoid(self.skip_gates[dec_step]).to(dtype=x.dtype)[None, None, :]
-                s_w = w * skips.pop()
-                if _SKIP_LERP:
-                    x = torch.lerp(s_w, x, gate)
+                w = self.skip_weights[dec_step]
+                gate = torch.sigmoid(self.skip_gates[dec_step])
+                if use_two_lane and lane0 is not None:
+                    w_l = w.to(dtype=lane0.dtype)[None, None, :]
+                    g_l = gate.to(dtype=lane0.dtype)[None, None, :]
+                    s_w = w_l * skips.pop()
+                    if _SKIP_LERP:
+                        lane0 = torch.lerp(s_w, lane0, g_l)
+                    else:
+                        lane0 = lane0 + g_l * s_w
                 else:
-                    x = x + gate * s_w
-            x, _ = self.blocks[block_idx](x, x0, cos, sin, v0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                    w_l = w.to(dtype=x.dtype)[None, None, :]
+                    g_l = gate.to(dtype=x.dtype)[None, None, :]
+                    s_w = w_l * skips.pop()
+                    if _SKIP_LERP:
+                        x = torch.lerp(s_w, x, g_l)
+                    else:
+                        x = x + g_l * s_w
+            if use_two_lane and block_idx >= psl:
+                if lane0 is None:
+                    lane0 = x
+                    lane1 = x.clone()
+                lane0, lane1, _ = self._two_lane_block(block_idx, lane0, lane1, x0, cos, sin, v0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            else:
+                x, _ = self.blocks[block_idx](x, x0, cos, sin, v0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        if use_two_lane and lane1 is not None:
+            x = lane1
         return x
 
     def _compute_logits(self, x: Tensor) -> Tensor:
@@ -1374,6 +1430,7 @@ def main() -> None:
     else:
         optimizer_muon = Muon(matrix_params, lr=_mlr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, wd=args.muon_wd, row_normalize=args.muon_row_normalize)
     for g in optimizer_muon.param_groups: g["base_lr"] = _mlr
+    for g in optimizer_muon.param_groups: g["base_wd"] = g.get("wd", args.muon_wd)
     if _depth_lr:
         _rec_set = set(id(p) for p in _rec_matrix); _dlf = float(os.environ.get("DEPTH_LR_FACTOR", "0.85"))
         optimizer_muon._lr_scales = [_dlf if id(p) in _rec_set else 1.0 for p in matrix_params]
@@ -1570,6 +1627,20 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
+        _wd_taper_start = float(os.environ.get("WD_TAPER_START_FRAC", "1.0"))
+        _wd_taper_final = float(os.environ.get("WD_TAPER_FINAL_MULT", "1.0"))
+        _elapsed_frac = (training_time_ms / max(max_wallclock_ms, 1.0)) if max_wallclock_ms is not None else (step / max(args.iterations, 1))
+        if _elapsed_frac < _wd_taper_start:
+            _wd_mult = 1.0
+        else:
+            _taper_progress = min((_elapsed_frac - _wd_taper_start) / max(1.0 - _wd_taper_start, 1e-6), 1.0)
+            _wd_mult = 1.0 + _taper_progress * (_wd_taper_final - 1.0)
+        for group in optimizer_muon.param_groups:
+            group["wd"] = group.get("base_wd", args.muon_wd) * _wd_mult
+        _two_lane_deact = float(os.environ.get("TWO_LANE_DEACTIVATE_AT", "1.0"))
+        if _TWO_LANE_ROUTING and getattr(base_model, "_two_lane_active", False) and _elapsed_frac >= _two_lane_deact:
+            base_model._two_lane_active = False
+            log0(f"two_lane: deactivated at frac {_elapsed_frac:.3f} step={step}")
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
