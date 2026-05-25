@@ -70,6 +70,7 @@ _ENABLE_SPHERE        = bool(int(os.environ.get("ENABLE_SPHERE", "1")))
 _SPHERICAL_INIT_TEMP  = float(os.environ.get("SPHERICAL_INIT_TEMP", "20.0"))
 
 
+
 # ===== Fused softcapped cross-entropy (Triton) — training-only path =====
 # Replaces the eager
 #     logits_softcap = softcap * tanh(logits / softcap)
@@ -1373,13 +1374,14 @@ class CausalSelfAttention(nn.Module):
         # V3SOTA SqDist: lift q,k to head_dim+2 via [q, -½‖q‖², 1] / [k, 1, -½‖k‖²].
         # Pad q,k,v to 96 head_dim for flash compat. Output sliced back to head_dim.
         # Effective attention score = -½‖q-k‖² (up to per-query constant).
+        # CRITICAL: cast back to q.dtype after sum-reduction (autocast policy promotes reductions to fp32).
         q_for_attn, k_for_attn, v_for_attn = q, k, v
         sq_pad_target = 0
         if _SQUARED_DIST_ATTN:
-            qe_sq = (q * q).sum(dim=-1, keepdim=True) * (-0.5)
+            qe_sq = ((q * q).sum(dim=-1, keepdim=True) * (-0.5)).to(q.dtype)
             qe_one = torch.ones_like(qe_sq)
             q_l_66 = torch.cat([q, qe_sq, qe_one], dim=-1)
-            ke_sq = (k * k).sum(dim=-1, keepdim=True) * (-0.5)
+            ke_sq = ((k * k).sum(dim=-1, keepdim=True) * (-0.5)).to(k.dtype)
             ke_one = torch.ones_like(ke_sq)
             k_l_66 = torch.cat([k, ke_one, ke_sq], dim=-1)
             # Pick next-supported head_dim ≥ head_dim+2 for flash_attn (32,64,96,128,160,192,224,256).
@@ -1388,9 +1390,9 @@ class CausalSelfAttention(nn.Module):
             sq_pad_target = next(d for d in supported if d >= lifted_d)
             pad_qk = sq_pad_target - lifted_d
             pad_v  = sq_pad_target - self.head_dim
-            q_for_attn = F.pad(q_l_66, (0, pad_qk))
-            k_for_attn = F.pad(k_l_66, (0, pad_qk))
-            v_for_attn = F.pad(v, (0, pad_v))
+            q_for_attn = F.pad(q_l_66, (0, pad_qk)).to(q.dtype)
+            k_for_attn = F.pad(k_l_66, (0, pad_qk)).to(k.dtype)
+            v_for_attn = F.pad(v, (0, pad_v)).to(v.dtype)
         if cu_seqlens is not None:
             y_raw = flash_attn_varlen_func(
                 q_for_attn[0],
